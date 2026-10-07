@@ -1,0 +1,41 @@
+name: Build myhelper package
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build package via OpenWrt SDK
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: aarch64_cortex-a53
+          FEEDNAME: packages_ci
+          PACKAGES: myhelper
+          NO_DEFAULT_FEEDS: 0
+          EXTRA_FEEDS: src-git luci https://git.openwrt.org/project/luci.git
+
+      - name: List build output
+        if: always()
+        run: |
+          echo "=== Contents of bin/ ==="
+          find bin/ -type f 2>/dev/null || echo "bin/ not found"
+          echo "=== Looking for .ipk ==="
+          find . -name '*.ipk' 2>/dev/null || echo "no .ipk found"
+
+      - name: Upload .ipk artifacts
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: myhelper-ipk
+          path: bin/packages/**/*.ipk
+          if-no-files-found: warn
+          retention-days: 30
