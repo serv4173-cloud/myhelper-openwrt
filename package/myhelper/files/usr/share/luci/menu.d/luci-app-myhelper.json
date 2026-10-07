@@ -1,0 +1,14 @@
+{
+    "admin/services/myhelper": {
+        "title": "MyHelper Game Boost",
+        "order": 30,
+        "action": {
+            "type": "view",
+            "path": "myhelper/game_boost"
+        },
+        "depends": {
+            "acl": [ "luci-app-myhelper" ],
+            "uci": { "myhelper": true }
+        }
+    }
+}
