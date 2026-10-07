@@ -1,0 +1,268 @@
+#!/bin/sh /etc/rc.common
+#
+# myhelper-watchdog - Watchdog + Game Boost for OpenWrt.
+#
+# Features:
+#   - procd-managed C daemon (myhelper_wd)
+#   - MAC-based game device prioritization via DHCP lease resolution
+#   - CAKE presets: balanced / low_latency / max_throughput / custom
+#   - Exposes resolved gaming IP to /tmp/myhelper_gaming_ip for the daemon
+#
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/myhelper_wd
+NFT_TABLE="myhelper_qos"
+IFB_DEV="ifb-myhelper"
+GAMING_IP_FILE="/tmp/myhelper_gaming_ip"
+
+EXTRA_COMMANDS="apply_qos"
+EXTRA_HELP="        apply_qos   Re-apply gaming QoS rules (nft + tc)"
+
+# ---------------------------------------------------------------------------
+# procd service lifecycle
+# ---------------------------------------------------------------------------
+start_service() {
+    config_load myhelper
+    config_get check_interval watchdog check_interval 60
+    config_get fail_threshold watchdog fail_threshold 3
+    config_get wan_iface      watchdog wan_interface  wan
+
+    procd_open_instance myhelper
+    procd_set_param command "$PROG" -f \
+        -i "$check_interval" \
+        -t "$fail_threshold" \
+        -w "$wan_iface"
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param limits nofile="1024 1024"
+    procd_close_instance
+
+    apply_qos
+}
+
+stop_service() {
+    cleanup_qos
+    rm -f "$GAMING_IP_FILE"
+    logger -t myhelper-watchdog "service stopping"
+}
+
+reload_service() {
+    logger -t myhelper-watchdog "reload requested, restarting"
+    stop
+    start
+}
+
+service_triggers() {
+    procd_add_reload_trigger "myhelper"
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+resolve_wan_dev() {
+    local uci_iface="$1"
+    local dev=""
+
+    if command -v ubus >/dev/null 2>&1; then
+        dev=$(ubus call network.interface."$uci_iface" status 2>/dev/null \
+              | jsonfilter -e '@.l3_device' 2>/dev/null)
+    fi
+    [ -n "$dev" ] || dev=$(uci -q get network."$uci_iface".ifname)
+    [ -n "$dev" ] || dev="$uci_iface"
+    echo "$dev"
+}
+
+resolve_mac_to_ip() {
+    local target_mac="$1"
+    local json dev idx mac ip
+
+    target_mac=$(echo "$target_mac" | tr 'A-Z' 'a-z')
+
+    json=$(ubus call dhcp ipv4leases 2>/dev/null) || return 1
+    [ -n "$json" ] || return 1
+
+    for dev in br-lan br-guest br-iot; do
+        idx=0
+        while :; do
+            mac=$(echo "$json" | jsonfilter \
+                  -e "@.device['$dev'].leases[$idx].mac" 2>/dev/null)
+            [ -z "$mac" ] && break
+            if [ "$(echo "$mac" | tr 'A-Z' 'a-z')" = "$target_mac" ]; then
+                echo "$json" | jsonfilter \
+                    -e "@.device['$dev'].leases[$idx].ip" 2>/dev/null
+                return 0
+            fi
+            idx=$((idx + 1))
+        done
+    done
+
+    idx=0
+    while :; do
+        mac=$(echo "$json" | jsonfilter -e "@.leases[$idx].mac" 2>/dev/null)
+        [ -z "$mac" ] && break
+        if [ "$(echo "$mac" | tr 'A-Z' 'a-z')" = "$target_mac" ]; then
+            echo "$json" | jsonfilter -e "@.leases[$idx].ip" 2>/dev/null
+            return 0
+        fi
+        idx=$((idx + 1))
+    done
+
+    return 1
+}
+
+cleanup_qos() {
+    nft delete table inet "$NFT_TABLE" 2>/dev/null
+
+    local wan_iface wan_dev
+    wan_iface=$(uci -q get myhelper.game_boost.wan_iface)
+    [ -n "$wan_iface" ] || wan_iface="wan"
+    wan_dev=$(resolve_wan_dev "$wan_iface")
+
+    [ -n "$wan_dev" ] && {
+        tc qdisc del dev "$wan_dev" root 2>/dev/null
+        tc qdisc del dev "$wan_dev" ingress 2>/dev/null
+    }
+    ip link del "$IFB_DEV" 2>/dev/null
+
+    logger -t myhelper-watchdog "QoS rules cleaned up"
+}
+
+cake_preset_flags() {
+    case "$1" in
+        balanced)
+            echo "diffserv4 triple-isolate nat wash ack-filter"
+            ;;
+        low_latency)
+            echo "diffserv8 dual-srchost nat ack-filter"
+            ;;
+        max_throughput)
+            echo "besteffort triple-isolate nat wash"
+            ;;
+        custom)
+            config_get custom_flags game_boost custom_cake_flags ""
+            echo "$custom_flags"
+            ;;
+        *)
+            echo "diffserv4 triple-isolate nat wash ack-filter"
+            ;;
+    esac
+}
+
+apply_qos() {
+    config_load myhelper
+    config_get enabled    game_boost enabled             0
+    config_get ports      game_boost ports               ""
+    config_get wan_if     game_boost wan_iface           "wan"
+    config_get bw_up      game_boost bandwidth_upload    "0"
+    config_get bw_down    game_boost bandwidth_download  "0"
+    config_get qos_preset game_boost qos_preset          "balanced"
+
+    if [ "$enabled" != "1" ]; then
+        logger -t myhelper-watchdog "game_boost disabled, skipping QoS"
+        rm -f "$GAMING_IP_FILE"
+        return 0
+    fi
+
+    cake_flags=$(cake_preset_flags "$qos_preset")
+    logger -t myhelper-watchdog \
+        "applying game_boost preset=$qos_preset ports=[$ports]"
+
+    nft delete table inet "$NFT_TABLE" 2>/dev/null
+    nft add table inet "$NFT_TABLE"
+    nft add chain inet "$NFT_TABLE" mark_out \
+        '{ type filter hook postrouting priority mangle ; policy accept ; }'
+
+    GAMING_IP_CAPTURED=""
+
+    handle_target_mac() {
+        local mac="$1"
+        [ -n "$mac" ] || return 0
+
+        local ip
+        ip=$(resolve_mac_to_ip "$mac")
+
+        if [ -z "$ip" ]; then
+            logger -t myhelper-watchdog \
+                "MAC $mac has no active DHCP lease, skipping"
+            return 0
+        fi
+
+        [ -z "$GAMING_IP_CAPTURED" ] && GAMING_IP_CAPTURED="$ip"
+
+        logger -t myhelper-watchdog "MAC $mac -> IP $ip (nft rule)"
+
+        nft add rule inet "$NFT_TABLE" mark_out \
+            ip saddr "$ip" ip dscp set cs6 \
+            comment '"myhelper: game host src"'
+        nft add rule inet "$NFT_TABLE" mark_out \
+            ip daddr "$ip" ip dscp set cs6 \
+            comment '"myhelper: game host dst"'
+    }
+    config_list_foreach game_boost target_mac handle_target_mac
+
+    if [ -n "$GAMING_IP_CAPTURED" ]; then
+        echo "$GAMING_IP_CAPTURED" > "$GAMING_IP_FILE"
+        logger -t myhelper-watchdog \
+            "gaming probe target exported: $GAMING_IP_CAPTURED"
+    else
+        rm -f "$GAMING_IP_FILE"
+        logger -t myhelper-watchdog "no gaming device resolved, probe disabled"
+    fi
+
+    if [ -n "$ports" ]; then
+        portset=$(echo "$ports" | tr ',' ' ')
+        nft add rule inet "$NFT_TABLE" mark_out \
+            tcp dport "{ $portset }" ip dscp set cs6 \
+            comment '"myhelper: game tcp ports"'
+        nft add rule inet "$NFT_TABLE" mark_out \
+            udp dport "{ $portset }" ip dscp set cs6 \
+            comment '"myhelper: game udp ports"'
+    fi
+
+    if [ "$bw_up" != "0" ] && [ -n "$bw_up" ]; then
+        wan_dev=$(resolve_wan_dev "$wan_if")
+        logger -t myhelper-watchdog \
+            "cake egress dev=$wan_dev rate=$bw_up preset=$qos_preset"
+
+        tc qdisc del dev "$wan_dev" root 2>/dev/null
+        # shellcheck disable=SC2086
+        tc qdisc add dev "$wan_dev" root cake \
+            bandwidth "$bw_up" \
+            $cake_flags \
+            memlimit 32mb \
+            || logger -t myhelper-watchdog "cake egress FAILED on $wan_dev"
+    fi
+
+    if [ "$bw_down" != "0" ] && [ -n "$bw_down" ]; then
+        wan_dev=$(resolve_wan_dev "$wan_if")
+
+        modprobe ifb 2>/dev/null
+        ip link del "$IFB_DEV" 2>/dev/null
+        ip link add "$IFB_DEV" type ifb 2>/dev/null || true
+        ip link set "$IFB_DEV" up
+
+        tc qdisc del dev "$wan_dev" ingress 2>/dev/null
+        tc qdisc add dev "$wan_dev" handle ffff: ingress
+        tc filter add dev "$wan_dev" parent ffff: protocol all u32 \
+            match u32 0 0 \
+            action mirred egress redirect dev "$IFB_DEV"
+
+        tc qdisc del dev "$IFB_DEV" root 2>/dev/null
+        # shellcheck disable=SC2086
+        tc qdisc add dev "$IFB_DEV" root cake \
+            bandwidth "$bw_down" \
+            $cake_flags \
+            memlimit 64mb \
+            || logger -t myhelper-watchdog "cake ingress FAILED"
+
+        logger -t myhelper-watchdog \
+            "cake ingress dev=$wan_dev ifb=$IFB_DEV rate=$bw_down preset=$qos_preset"
+    fi
+
+    logger -t myhelper-watchdog "game_boost applied OK"
+}
