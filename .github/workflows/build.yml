@@ -21,7 +21,6 @@ jobs:
           FEEDNAME: packages_ci
           PACKAGES: myhelper
           NO_DEFAULT_FEEDS: 0
-          EXTRA_FEEDS: src-git luci https://git.openwrt.org/project/luci.git
 
       - name: List build output
         if: always()
