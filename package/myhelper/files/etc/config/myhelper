@@ -1,0 +1,18 @@
+config myhelper 'watchdog'
+    option enabled         '1'
+    option check_interval  '60'
+    option fail_threshold  '3'
+    option wan_interface   'wan'
+    option probe_host_1    '1.1.1.1'
+    option probe_host_2    '8.8.8.8'
+
+config game_boost 'settings'
+    option enabled             '0'
+    # List of gaming device MACs. Resolved to current DHCP IP on every apply.
+    list   target_mac          'aa:bb:cc:dd:ee:ff'
+    option ports               '3074,27015,27016,3478,3479,3480'
+    option wan_iface           'wan'
+    option bandwidth_upload    '0'
+    option bandwidth_download  '0'
+    # CAKE preset: balanced | low_latency | max_throughput | custom
+    option qos_preset          'balanced'
