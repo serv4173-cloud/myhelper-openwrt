@@ -12,27 +12,60 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build package via OpenWrt SDK
-        uses: openwrt/gh-action-sdk@main
-        env:
-          ARCH: aarch64_cortex-a53
-          FEEDNAME: packages_ci
-          PACKAGES: myhelper
-          NO_DEFAULT_FEEDS: 0
-
-      - name: List build output
-        if: always()
+      - name: Download OpenWrt SDK for qualcommax/ipq53xx
         run: |
-          echo "=== Contents of bin/ ==="
-          find bin/ -type f 2>/dev/null || echo "bin/ not found"
-          echo "=== Looking for .ipk ==="
-          find . -name '*.ipk' 2>/dev/null || echo "no .ipk found"
+          set -e
+          mkdir -p sdk
+          cd sdk
+          # Find the SDK tarball on the OpenWrt download mirror
+          INDEX_URL="https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq53xx/"
+          echo "Fetching index from $INDEX_URL"
+          wget -q "$INDEX_URL" -O index.html
+          SDK_FILE=$(grep -o 'openwrt-sdk-qualcommax-ipq53xx[^"]*\.tar\.zst' index.html | head -n 1)
+          if [ -z "$SDK_FILE" ]; then
+            echo "ERROR: could not find SDK tarball in index"
+            cat index.html | head -50
+            exit 1
+          fi
+          echo "Downloading $SDK_FILE"
+          wget -q "$INDEX_URL$SDK_FILE"
+          tar --zstd -xf "$SDK_FILE"
+          rm -f "$SDK_FILE"
+          ls -la
+
+      - name: Copy package into SDK
+        run: |
+          set -e
+          SDK_DIR=$(find sdk -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)
+          echo "SDK_DIR=$SDK_DIR"
+          mkdir -p "$SDK_DIR/package/myhelper"
+          cp -r package/myhelper/* "$SDK_DIR/package/myhelper/"
+          ls -la "$SDK_DIR/package/myhelper/"
+
+      - name: Build package
+        run: |
+          set -e
+          SDK_DIR=$(find sdk -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)
+          cd "$SDK_DIR"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "CONFIG_PACKAGE_myhelper=y" >> .config
+          make defconfig
+          make package/myhelper/compile V=s -j$(nproc)
+
+      - name: Collect .ipk
+        run: |
+          set -e
+          SDK_DIR=$(find sdk -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)
+          mkdir -p output
+          find "$SDK_DIR/bin" -name 'myhelper*.ipk' -exec cp {} output/ \;
+          ls -la output/
 
       - name: Upload .ipk artifacts
         uses: actions/upload-artifact@v4
         if: success()
         with:
           name: myhelper-ipk
-          path: bin/packages/**/*.ipk
-          if-no-files-found: warn
+          path: output/*.ipk
+          if-no-files-found: error
           retention-days: 30
