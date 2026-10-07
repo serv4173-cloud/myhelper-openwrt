@@ -1,0 +1,24 @@
+{
+    "luci-app-myhelper": {
+        "description": "MyHelper watchdog + Game Boost",
+        "read": {
+            "uci": [ "myhelper", "network" ],
+            "ubus": {
+                "myhelper": [ "status" ],
+                "dhcp":     [ "ipv4leases" ],
+                "rc":       [ "list", "init" ],
+                "service":  [ "list" ]
+            },
+            "file": {
+                "/etc/init.d/myhelper-watchdog": [ "exec" ]
+            }
+        },
+        "write": {
+            "uci": [ "myhelper" ],
+            "ubus": {
+                "myhelper": [ "force_recovery", "qos_reapply" ],
+                "rc":       [ "init" ]
+            }
+        }
+    }
+}
