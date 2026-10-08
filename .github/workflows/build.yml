@@ -18,38 +18,34 @@ jobs:
           set -e
           mkdir -p sdk
           cd sdk
-
-          # aria2c is not on the runner by default.
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2
-
           BASE="https://mirror-03.infra.openwrt.org/snapshots/targets/qualcommax/ipq50xx/"
-
-          echo "Fetching index..."
           curl --http1.1 -fsSL --max-time 60 -o index.html "$BASE"
-
           SDK_FILE=$(grep -o 'openwrt-sdk-qualcommax-ipq50xx[^"]*\.tar\.zst' index.html | head -n 1)
-          if [ -z "$SDK_FILE" ]; then
-            echo "SDK not found in index"
-            exit 1
-          fi
-          echo "SDK file: $SDK_FILE"
-
-          echo "Downloading with aria2c (16 parallel connections)..."
-          aria2c -x 16 -s 16 -k 1M \
-                 --max-tries=5 --retry-wait=5 \
-                 --console-log-level=warn \
-                 --summary-interval=30 \
-                 -o "$SDK_FILE" \
-                 "$BASE$SDK_FILE"
-
-          echo "Downloaded:"
-          ls -la "$SDK_FILE"
-
+          aria2c -x 16 -s 16 -k 1M --max-tries=5 --retry-wait=5 \
+                 --console-log-level=warn --summary-interval=30 \
+                 -o "$SDK_FILE" "$BASE$SDK_FILE"
           tar --zstd -xf "$SDK_FILE"
           rm -f "$SDK_FILE"
-          echo "Extracted:"
-          ls -la
+
+      - name: Fix Makefile tabs
+        run: |
+          set -e
+          FILE="package/myhelper/Makefile"
+          echo "=== BEFORE: lines with leading whitespace ==="
+          grep -nP '^[ \t]' "$FILE" | head -20 | cat -A
+          echo "=== Fixing: 4 spaces -> 1 tab ==="
+          sed -i 's/^    /\t/' "$FILE"
+          echo "=== AFTER: lines with leading tabs ==="
+          grep -nP '^\t' "$FILE" | head -20 | cat -A
+          echo "=== Check for remaining leading spaces ==="
+          if grep -qP '^ ' "$FILE"; then
+            echo "WARNING: still found leading spaces:"
+            grep -nP '^ ' "$FILE" | head -10
+          else
+            echo "OK: no leading spaces remain"
+          fi
 
       - name: Copy package into SDK
         run: |
