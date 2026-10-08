@@ -17,10 +17,10 @@ jobs:
           set -e
           mkdir -p sdk
           cd sdk
-          INDEX_URL="https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq53xx/"
+          INDEX_URL="https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq50xx/"
           echo "Fetching index from $INDEX_URL"
           wget -q "$INDEX_URL" -O index.html
-          SDK_FILE=$(grep -o 'openwrt-sdk-qualcommax-ipq53xx[^"]*\.tar\.zst' index.html | head -n 1)
+          SDK_FILE=$(grep -o 'openwrt-sdk-qualcommax-ipq50xx[^"]*\.tar\.zst' index.html | head -n 1)
           if [ -z "$SDK_FILE" ]; then
             echo "ERROR: could not find SDK tarball in index"
             cat index.html | head -50
