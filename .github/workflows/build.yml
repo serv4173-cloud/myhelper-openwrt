@@ -18,17 +18,19 @@ jobs:
           mkdir -p sdk
           cd sdk
 
+          # Try fast mirrors directly (skip the redirector that may throttle).
           MIRRORS="
-            https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
             https://mirror-03.infra.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
             https://mirror-02.infra.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
+            https://mirror-01.infra.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
+            https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
           "
 
           SDK_FILE=""
           INDEX_OK=""
           for M in $MIRRORS; do
             echo "Trying mirror: $M"
-            if curl -fsSL --max-time 60 -o index.html "$M"; then
+            if curl --http1.1 -fsSL --max-time 60 -o index.html "$M"; then
               SDK_FILE=$(grep -o 'openwrt-sdk-qualcommax-ipq50xx[^"]*\.tar\.zst' index.html | head -n 1)
               if [ -n "$SDK_FILE" ]; then
                 INDEX_OK="$M"
@@ -45,9 +47,14 @@ jobs:
           fi
 
           echo "Downloading $SDK_FILE from $INDEX_OK"
-          curl -fL --retry 5 --retry-delay 5 --retry-connrefused \
+          # --http1.1          : avoid HTTP/2 stream bugs on large files
+          # --retry-all-errors : retry even on PROTOCOL_ERROR etc.
+          # --speed-time/--speed-limit : abort if slower than 100KB/s for 60s
+          curl --http1.1 -fL \
+               --retry 10 --retry-delay 5 --retry-all-errors \
                --connect-timeout 30 --max-time 1800 \
-               -C - -o "$SDK_FILE" "$INDEX_OK$SDK_FILE"
+               --speed-time 60 --speed-limit 102400 \
+               -o "$SDK_FILE" "$INDEX_OK$SDK_FILE"
 
           echo "Download done, size:"
           ls -la "$SDK_FILE"
