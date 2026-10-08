@@ -8,59 +8,43 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download OpenWrt SDK for qualcommax/ipq50xx
+      - name: Download OpenWrt SDK (ipq50xx)
         run: |
           set -e
           mkdir -p sdk
           cd sdk
 
-          # Try fast mirrors directly (skip the redirector that may throttle).
-          MIRRORS="
-            https://mirror-03.infra.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
-            https://mirror-02.infra.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
-            https://mirror-01.infra.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
-            https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
-          "
+          # Fast mirror, single try with short timeout.
+          # If it fails, we switch mirror manually.
+          BASE="https://mirror-03.infra.openwrt.org/snapshots/targets/qualcommax/ipq50xx/"
 
-          SDK_FILE=""
-          INDEX_OK=""
-          for M in $MIRRORS; do
-            echo "Trying mirror: $M"
-            if curl --http1.1 -fsSL --max-time 60 -o index.html "$M"; then
-              SDK_FILE=$(grep -o 'openwrt-sdk-qualcommax-ipq50xx[^"]*\.tar\.zst' index.html | head -n 1)
-              if [ -n "$SDK_FILE" ]; then
-                INDEX_OK="$M"
-                echo "Found SDK on $M -> $SDK_FILE"
-                break
-              fi
-            fi
-            echo "Mirror did not work, trying next..."
-          done
+          echo "Fetching index..."
+          curl --http1.1 -fsSL --max-time 60 -o index.html "$BASE"
 
+          SDK_FILE=$(grep -o 'openwrt-sdk-qualcommax-ipq50xx[^"]*\.tar\.zst' index.html | head -n 1)
           if [ -z "$SDK_FILE" ]; then
-            echo "ERROR: could not find SDK tarball on any mirror"
+            echo "SDK not found in index"
             exit 1
           fi
+          echo "SDK file: $SDK_FILE"
 
-          echo "Downloading $SDK_FILE from $INDEX_OK"
-          # --http1.1          : avoid HTTP/2 stream bugs on large files
-          # --retry-all-errors : retry even on PROTOCOL_ERROR etc.
-          # --speed-time/--speed-limit : abort if slower than 100KB/s for 60s
+          echo "Downloading (this should take 2-5 min on a good mirror)..."
           curl --http1.1 -fL \
-               --retry 10 --retry-delay 5 --retry-all-errors \
                --connect-timeout 30 --max-time 1800 \
-               --speed-time 60 --speed-limit 102400 \
-               -o "$SDK_FILE" "$INDEX_OK$SDK_FILE"
+               --retry 3 --retry-delay 10 \
+               -o "$SDK_FILE" "$BASE$SDK_FILE"
 
-          echo "Download done, size:"
+          echo "Downloaded:"
           ls -la "$SDK_FILE"
 
           tar --zstd -xf "$SDK_FILE"
           rm -f "$SDK_FILE"
+          echo "Extracted:"
           ls -la
 
       - name: Copy package into SDK
