@@ -17,7 +17,6 @@ jobs:
           set -e
           mkdir -p sdk
           cd sdk
-          # Find the SDK tarball on the OpenWrt download mirror
           INDEX_URL="https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq53xx/"
           echo "Fetching index from $INDEX_URL"
           wget -q "$INDEX_URL" -O index.html
