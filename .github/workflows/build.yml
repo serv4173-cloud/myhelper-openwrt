@@ -33,19 +33,9 @@ jobs:
         run: |
           set -e
           FILE="package/myhelper/Makefile"
-          echo "=== BEFORE: lines with leading whitespace ==="
-          grep -nP '^[ \t]' "$FILE" | head -20 | cat -A
-          echo "=== Fixing: 4 spaces -> 1 tab ==="
+          grep -nP '^[ \t]' "$FILE" | head -20 | cat -A || true
           sed -i 's/^    /\t/' "$FILE"
-          echo "=== AFTER: lines with leading tabs ==="
-          grep -nP '^\t' "$FILE" | head -20 | cat -A
-          echo "=== Check for remaining leading spaces ==="
-          if grep -qP '^ ' "$FILE"; then
-            echo "WARNING: still found leading spaces:"
-            grep -nP '^ ' "$FILE" | head -10
-          else
-            echo "OK: no leading spaces remain"
-          fi
+          grep -nP '^\t' "$FILE" | head -20 | cat -A || true
 
       - name: Copy package into SDK
         run: |
@@ -65,21 +55,45 @@ jobs:
           ./scripts/feeds install -a
           echo "CONFIG_PACKAGE_myhelper=y" >> .config
           make defconfig
+          echo "=== .config check ==="
+          grep -E 'CONFIG_PACKAGE_myhelper' .config || echo "!!! myhelper NOT in .config !!!"
           make package/myhelper/compile V=s -j$(nproc)
+          echo "=== All myhelper files inside SDK ==="
+          find "$SDK_DIR/bin" -name 'myhelper*' -exec ls -la {} \; || true
+          echo "=== All .apk files ==="
+          find "$SDK_DIR/bin" -name '*.apk' -exec ls -la {} \; || true
+          echo "=== All .ipk files ==="
+          find "$SDK_DIR/bin" -name '*.ipk' -exec ls -la {} \; || true
 
-      - name: Collect .ipk
+      - name: Collect .ipk or .apk
         run: |
           set -e
           SDK_DIR=$(find sdk -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)
           mkdir -p output
-          find "$SDK_DIR/bin" -name 'myhelper*.ipk' -exec cp {} output/ \;
+
+          # Prefer .ipk (opkg) — grab it if present.
+          find "$SDK_DIR/bin" -name 'myhelper*.ipk' -exec cp -v {} output/ \; || true
+
+          # Also grab .apk (new format used by snapshots).
+          find "$SDK_DIR/bin" -name 'myhelper*.apk' -exec cp -v {} output/ \; || true
+
+          echo "=== output/ contents ==="
           ls -la output/
 
-      - name: Upload .ipk artifacts
+          if [ -z "$(ls -A output)" ]; then
+            echo "ERROR: output is empty — nothing collected"
+            echo "=== Diagnostic: tree of bin/packages ==="
+            find "$SDK_DIR/bin/packages" -maxdepth 4 -type f | head -50
+            exit 1
+          fi
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: myhelper-ipk
-          path: output/*.ipk
+          name: myhelper-package
+          path: |
+            output/*.ipk
+            output/*.apk
           if-no-files-found: error
           retention-days: 30
