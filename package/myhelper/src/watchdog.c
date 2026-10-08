@@ -223,11 +223,25 @@ static void history_load_into(const char *key,
         blob_buf_free(&b); free(json); return;
     }
 
-    struct blob_attr *arr = blobmsg_lookup(b.head, key);
-    if (!arr || blobmsg_type(arr) != BLOBMSG_TYPE_ARRAY) {
-        blob_buf_free(&b); free(json); return;
-    }
+    /* Note: blobmsg_lookup() was removed from recent libubox.
+ * Use blobmsg_parse() with a policy to extract the array. */
+static const struct blobmsg_policy top_policy[] = {
+    { .name = "samples",        .type = BLOBMSG_TYPE_ARRAY },
+    { .name = "samples_device", .type = BLOBMSG_TYPE_ARRAY },
+};
+struct blob_attr *top[ARRAY_SIZE(top_policy)];
+blobmsg_parse(top_policy, ARRAY_SIZE(top_policy), top,
+              blob_data(b.head), blob_len(b.head));
 
+struct blob_attr *arr = NULL;
+if (strcmp(key, "samples") == 0)
+    arr = top[0];
+else if (strcmp(key, "samples_device") == 0)
+    arr = top[1];
+
+if (!arr || blobmsg_type(arr) != BLOBMSG_TYPE_ARRAY) {
+    blob_buf_free(&b); free(json); return;
+}
     struct blob_attr *cur;
     int rem = blobmsg_len(arr);
     blobmsg_for_each_attr(cur, arr, rem) {
