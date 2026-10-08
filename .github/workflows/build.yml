@@ -12,22 +12,46 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download OpenWrt SDK for qualcommax/ipq53xx
+      - name: Download OpenWrt SDK for qualcommax/ipq50xx
         run: |
           set -e
           mkdir -p sdk
           cd sdk
-          INDEX_URL="https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq50xx/"
-          echo "Fetching index from $INDEX_URL"
-          wget -q "$INDEX_URL" -O index.html
-          SDK_FILE=$(grep -o 'openwrt-sdk-qualcommax-ipq50xx[^"]*\.tar\.zst' index.html | head -n 1)
+
+          MIRRORS="
+            https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
+            https://mirror-03.infra.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
+            https://mirror-02.infra.openwrt.org/snapshots/targets/qualcommax/ipq50xx/
+          "
+
+          SDK_FILE=""
+          INDEX_OK=""
+          for M in $MIRRORS; do
+            echo "Trying mirror: $M"
+            if curl -fsSL --max-time 60 -o index.html "$M"; then
+              SDK_FILE=$(grep -o 'openwrt-sdk-qualcommax-ipq50xx[^"]*\.tar\.zst' index.html | head -n 1)
+              if [ -n "$SDK_FILE" ]; then
+                INDEX_OK="$M"
+                echo "Found SDK on $M -> $SDK_FILE"
+                break
+              fi
+            fi
+            echo "Mirror did not work, trying next..."
+          done
+
           if [ -z "$SDK_FILE" ]; then
-            echo "ERROR: could not find SDK tarball in index"
-            cat index.html | head -50
+            echo "ERROR: could not find SDK tarball on any mirror"
             exit 1
           fi
-          echo "Downloading $SDK_FILE"
-          wget -q "$INDEX_URL$SDK_FILE"
+
+          echo "Downloading $SDK_FILE from $INDEX_OK"
+          curl -fL --retry 5 --retry-delay 5 --retry-connrefused \
+               --connect-timeout 30 --max-time 1800 \
+               -C - -o "$SDK_FILE" "$INDEX_OK$SDK_FILE"
+
+          echo "Download done, size:"
+          ls -la "$SDK_FILE"
+
           tar --zstd -xf "$SDK_FILE"
           rm -f "$SDK_FILE"
           ls -la
