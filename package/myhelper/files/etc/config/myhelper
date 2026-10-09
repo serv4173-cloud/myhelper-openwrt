@@ -8,11 +8,31 @@ config myhelper 'watchdog'
 
 config game_boost 'settings'
     option enabled             '0'
-    # List of gaming device MACs. Resolved to current DHCP IP on every apply.
     list   target_mac          'aa:bb:cc:dd:ee:ff'
     option ports               '3074,27015,27016,3478,3479,3480'
     option wan_iface           'wan'
     option bandwidth_upload    '0'
     option bandwidth_download  '0'
-    # CAKE preset: balanced | low_latency | max_throughput | custom
+    # CAKE preset: balanced | low_latency | max_throughput | game_boost | custom
     option qos_preset          'balanced'
+
+    # === HFSC Game Boost parameters ===
+    # Guaranteed bandwidth for game traffic (kbit/s).
+    # For 100 Mbit link: recommend 5000-10000 (5-10 Mbit guarantee).
+    option game_bandwidth_guarantee '8000'
+    # Max delay in the game class (packets), lower = less latency, but drops at burst.
+    option game_pfifo_limit        '10'
+
+    # === Link layer adaptation (PPPoE/Ethernet overhead) ===
+    # Options: 'none' | 'ethernet' | 'atm'
+    # For DHCP + Ethernet: use 'ethernet', overhead '34' (14+8+12 optional VLAN)
+    option linklayer           'ethernet'
+    option overhead            '34'
+
+    # === BBR congestion control ===
+    option bbr_enabled         '0'
+
+    # === Auto-measured bandwidth (written by LuCI speedtest button) ===
+    option speedtest_upload    '0'
+    option speedtest_download  '0'
+    option speedtest_timestamp '0'
