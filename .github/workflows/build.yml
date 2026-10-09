@@ -41,6 +41,22 @@ jobs:
           cp -r package/myhelper/* openwrt-src/package/myhelper/
           ls -la openwrt-src/package/myhelper/
 
+      - name: Fix Makefile tabs
+        run: |
+          set -e
+          FILE="openwrt-src/package/myhelper/Makefile"
+          echo "=== BEFORE ==="
+          grep -nP '^[ \t]' "$FILE" | head -20 | cat -A
+          echo "=== Fixing ==="
+          sed -i 's/^    /\t/' "$FILE"
+          echo "=== AFTER ==="
+          grep -nP '^\t' "$FILE" | head -20 | cat -A
+          if grep -qP '^ ' "$FILE"; then
+            echo "WARNING: leading spaces remain"
+          else
+            echo "OK: no leading spaces"
+          fi
+
       - name: Prepare config for RD16
         run: |
           set -e
@@ -84,7 +100,6 @@ jobs:
           set -e
           cd openwrt-src
           echo "=== Running build_kmod_toolchain.sh ==="
-          # This script also builds tools/install if needed
           bash vendor_scripts/build_kmod_toolchain.sh
 
       - name: Build userspace toolchain (GCC 13.3.0)
