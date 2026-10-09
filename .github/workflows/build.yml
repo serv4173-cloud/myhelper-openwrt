@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 480
     steps:
       - name: Checkout myhelper package
         uses: actions/checkout@v4
@@ -19,15 +19,20 @@ jobs:
           sudo apt-get install -y -qq build-essential clang flex bison g++ gawk \
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
             python3 python3-setuptools rsync subversion swig time unzip \
-            zlib1g-dev file wget bc libelf-dev
+            zlib1g-dev file wget bc libelf-dev cpio aria2
 
-      - name: Clone RomikB OpenWrt source (branch openwrt-24-rd15)
+      - name: Clone RomikB source (branch openwrt-24-rd15)
         run: |
           set -e
           git clone --depth 1 --branch openwrt-24-rd15 \
             https://github.com/RomikB/openwrt.git openwrt-src
           cd openwrt-src
+          echo "=== Top-level ==="
           ls -la
+          echo "=== vendor_scripts/ ==="
+          ls -la vendor_scripts/
+          echo "=== vendor_toolchain/ ==="
+          ls -la vendor_toolchain/ 2>/dev/null || echo "no vendor_toolchain"
 
       - name: Copy myhelper into source tree
         run: |
@@ -36,33 +41,53 @@ jobs:
           cp -r package/myhelper/* openwrt-src/package/myhelper/
           ls -la openwrt-src/package/myhelper/
 
-      - name: Configure .config for ipq53xx/rd16
+      - name: Prepare config for RD16
         run: |
           set -e
           cd openwrt-src
-          rm -f .config
+          chmod +x vendor_scripts/*.sh vendor_scripts/*.py 2>/dev/null || true
+          echo "=== Running prepare_config.sh rd16 ==="
+          sh vendor_scripts/prepare_config.sh rd16
+          echo "=== .config after prepare_config ==="
+          grep -E '^CONFIG_TARGET' .config | head -20
 
-          cat > .config << 'EOF'
-          CONFIG_TARGET_ipq53xx=y
-          CONFIG_TARGET_ipq53xx_rd16=y
-          CONFIG_PACKAGE_myhelper=y
-          EOF
+      - name: Prepare feeds
+        run: |
+          set -e
+          cd openwrt-src
+          echo "=== Running prepare_feed.sh ==="
+          sh vendor_scripts/prepare_feed.sh || true
+          echo "=== feeds.conf ==="
+          cat feeds.conf 2>/dev/null || cat feeds.conf.default
 
+      - name: Update feeds and enable myhelper
+        run: |
+          set -e
+          cd openwrt-src
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          # Enable our package (must be after prepare_config.sh, which wipes .config)
+          echo "CONFIG_PACKAGE_myhelper=y" >> .config
           make defconfig
 
-          echo "=== Target check ==="
-          grep -E '^CONFIG_TARGET_(arch|board|subtarget|profile)' .config | head -10
+          echo "=== Verify target ==="
+          grep -E '^CONFIG_TARGET_arch=' .config || true
           grep -E '^CONFIG_TARGET_ipq53xx' .config | head -10
-          echo "=== myhelper in config? ==="
-          grep -E 'CONFIG_PACKAGE_myhelper' .config || echo "!!! not in config !!!"
+          grep -E '^CONFIG_TARGET_DEVICE' .config | head -5
 
-      - name: Build host tools
+          echo "=== Verify myhelper in config ==="
+          grep -E 'CONFIG_PACKAGE_myhelper' .config || echo "!!! myhelper NOT in .config !!!"
+
+      - name: Build kernel module toolchain (GCC 7.5.0)
         run: |
           set -e
           cd openwrt-src
-          make tools/install V=s -j$(nproc)
+          echo "=== Running build_kmod_toolchain.sh ==="
+          # This script also builds tools/install if needed
+          bash vendor_scripts/build_kmod_toolchain.sh
 
-      - name: Build toolchain
+      - name: Build userspace toolchain (GCC 13.3.0)
         run: |
           set -e
           cd openwrt-src
@@ -73,7 +98,7 @@ jobs:
           set -e
           cd openwrt-src
           make package/myhelper/compile V=s -j$(nproc)
-          echo "=== myhelper artifacts ==="
+          echo "=== myhelper artifacts in bin/ ==="
           find bin -name 'myhelper*' -exec ls -la {} \; || true
 
       - name: Collect package
@@ -82,9 +107,11 @@ jobs:
           mkdir -p output
           find openwrt-src/bin -name 'myhelper*.ipk' -exec cp -v {} output/ \; || true
           find openwrt-src/bin -name 'myhelper*.apk' -exec cp -v {} output/ \; || true
+          echo "=== output contents ==="
           ls -la output/
           if [ -z "$(ls -A output)" ]; then
-            echo "ERROR: empty output"
+            echo "ERROR: no myhelper package produced"
+            echo "=== diagnostic: bin tree ==="
             find openwrt-src/bin -maxdepth 4 -type f | head -60
             exit 1
           fi
