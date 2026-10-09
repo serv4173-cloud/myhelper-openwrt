@@ -129,7 +129,7 @@ function renderSvgGraph(hist, opts) {
     var barW = Math.max(1, w / n - 1);
     var children = [
         E('rect', { x: 0, y: 0, width: W, height: H,
-                    fill: '#fafafa', stroke: '#ddd' })
+            fill: 'transparent', stroke: '#888' })
     ];
 
     hist.forEach(function (s, i) {
