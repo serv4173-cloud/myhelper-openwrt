@@ -104,6 +104,7 @@ var CAKE_PRESETS = [
     { value: 'balanced',       label: 'Balanced (diffserv4)' },
     { value: 'low_latency',    label: 'Low Latency (diffserv8 + dual-srchost)' },
     { value: 'max_throughput', label: 'Max Throughput (besteffort)' },
+    { value: 'game_boost',     label: 'Game Boost (HFSC + pfifo + CAKE)' },
     { value: 'custom',         label: 'Custom' }
 ];
 
@@ -575,6 +576,34 @@ return view.extend({
         o.default = 'balanced';
         o.rmempty = false;
         o.depends('enabled', '1');
+        o = s.option(form.ListValue, 'qos_preset', _('CAKE Preset'),
+    _('Traffic shaping profile. Choose "Low Latency" for competitive gaming, ' +
+      '"Balanced" for mixed home use, "Max Throughput" for pure bandwidth.'));
+CAKE_PRESETS.forEach(function (p) {
+    o.value(p.value, _(p.label));
+});
+o.default = 'balanced';
+o.rmempty = false;
+o.depends('enabled', '1');
+        
+/* ---------- HFSC Game Boost parameters ---------- */
+o = s.option(form.Value, 'game_bandwidth_guarantee',
+    _('Game Bandwidth Guarantee'),
+    _('Guaranteed kbit/s for game traffic (HFSC). For 100 Mbit link ' +
+      'recommend 5000-10000. Only used by "Game Boost" preset.'));
+o.datatype = 'uinteger';
+o.placeholder = '8000';
+o.default = '8000';
+o.depends('qos_preset', 'game_boost');
+
+o = s.option(form.Value, 'game_pfifo_limit',
+    _('Game Packet Queue Limit'),
+    _('pfifo queue depth for game class. Lower = lower latency, ' +
+      'but drops on burst. 10 packets is a good default.'));
+o.datatype = 'uinteger';
+o.placeholder = '10';
+o.default = '10';
+o.depends('qos_preset', 'game_boost');
 
         o = s.option(form.DynamicList, 'target_mac', _('Gaming Device MACs'),
             _('Traffic to/from these MACs is marked DSCP CS6.'));
@@ -623,18 +652,93 @@ return view.extend({
         o = s.option(form.Value, 'bandwidth_download', _('Download Bandwidth'),
             _('CAKE ingress rate via IFB, e.g. "200mbit". "0" disables.'));
         o.placeholder = '0'; o.depends('enabled', '1');
+        
+/* ---------- Link layer adaptation ---------- */
+o = s.option(form.ListValue, 'linklayer', _('Link Layer'),
+    _('Type of link for overhead calculation.'));
+o.value('none',     _('None (raw IP)'));
+o.value('ethernet', _('Ethernet (14 bytes header)'));
+o.value('atm',      _('ATM (for ADSL)'));
+o.default = 'ethernet';
+o.rmempty = false;
+
+o = s.option(form.Value, 'overhead', _('Overhead (bytes)'),
+    _('Bytes to add per packet. DHCP+Ethernet: 34. ' +
+      'PPPoE: 42. PPPoE+VLAN: 46.'));
+o.datatype = 'uinteger';
+o.placeholder = '34';
+o.default = '34';
+
+/* ---------- BBR congestion control ---------- */
+o = s.option(form.Flag, 'bbr_enabled', _('Enable BBR'),
+    _('Google BBR TCP congestion control. Reduces latency on lossy ' +
+      'links. May cause UDP issues on some ISPs — roll back if game ' +
+      'voice chat breaks.'));
+o.rmempty = false;
+o.default = '0';
 
         /* ---- Tab 3: Devices ---- */
         s = m.section(form.NamedSection, 'game_boost', 'settings', _('Devices'));
         s.tab = 'devices'; s.anonymous = true; s.addremove = false;
 
-        o = s.option(form.DummyValue, '_devices');
-        o.rawhtml  = false;
-        o.cfgvalue = function () { return ''; };
-        o.render   = function () { return self.renderDevicesTable(); };
+            o = s.option(form.DummyValue, '_devices');
+    o.rawhtml  = false;
+    o.cfgvalue = function () { return ''; };
+    o.render   = function () { return self.renderDevicesTable(); };
 
-        return m;
-    },
+    /* ---- Speedtest button ---- */
+    var callSpeedtest = rpc.declare({
+        object: 'rc',
+        method: 'init',
+        params: [ 'name', 'action' ],
+        expect: { result: false }
+    });
+
+    s = m.section(form.NamedSection, 'game_boost', 'settings',
+                  _('Bandwidth Measurement'));
+    s.tab = 'game_boost'; s.anonymous = true; s.addremove = false;
+
+    o = s.option(form.DummyValue, '_speedtest');
+    o.rawhtml  = false;
+    o.cfgvalue = function () { return ''; };
+    o.render   = function () {
+        var btn = E('button', {
+            'class': 'cbi-button cbi-button-action',
+            'click': ui.createHandlerFn(this, function (ev) {
+                ev.preventDefault();
+                ui.showModal(_('Speedtest'), [
+                    E('p', { 'class': 'spinning' },
+                      _('Measuring speed... This takes 30-60 seconds.'))
+                ]);
+                return callSpeedtest('myhelper-watchdog', 'speedtest')
+                    .then(function () {
+                        ui.hideModal();
+                        ui.addNotification(null,
+                            E('p', _('Speedtest complete. Reload the page ' +
+                                     'to see updated values.')), 'info');
+                    }).catch(function (err) {
+                        ui.hideModal();
+                        ui.addNotification(null,
+                            E('p', _('Speedtest failed: %s').format(err)),
+                            'error');
+                    });
+            })
+        }, _('Measure Speed Now'));
+
+        return E('div', { 'class': 'cbi-value' }, [
+            E('label', { 'class': 'cbi-value-title' }, _('Speedtest')),
+            E('div', { 'class': 'cbi-value-field' }, [
+                btn,
+                E('div', { 'style': 'font-size: 11px; color: #666; ' +
+                                   'margin-top: 4px;' },
+                  _('Runs speedtest-netperf and stores results in UCI. ' +
+                    'Use this to auto-fill bandwidth values above.'))
+            ])
+        ]);
+    };
+
+    return m;
+    }
 
     /* ---------------------------------------------------------------
      * Render
