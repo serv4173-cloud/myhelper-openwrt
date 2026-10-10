@@ -55,6 +55,30 @@ jobs:
           sh vendor_scripts/prepare_config.sh rd16
           echo "=== Target check ==="
           grep -E '^CONFIG_TARGET' .config | head -20
+          
+      - name: Disable QSDK Wi-Fi CLI packages (hostapd 404 workaround)
+        run: |
+          set -e
+          cd openwrt-src
+
+          # These packages require hostapd-2022-09-19.tar.bz2, which is gone from
+          # all mirrors. Standard hostapd/wpa_supplicant from feeds is enough.
+          for pkg in qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor qca-hostap-vendor; do
+          echo "Disabling: PACKAGE_${pkg}"
+          ./scripts/config --file .config -d "PACKAGE_${pkg}" || true
+          done
+
+          # Regenerate config, keeping our disables
+          make defconfig
+
+          echo "=== Verify QSDK CLI packages are DISABLED ==="
+          for pkg in qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor qca-hostap-vendor; do
+          if grep -qE "^CONFIG_PACKAGE_${pkg}=y" .config; then
+          echo "!!! ERROR: ${pkg} STILL ENABLED !!!"
+          else
+          echo "OK: ${pkg} disabled"
+          fi
+          done
 
       - name: Prepare feeds
         run: |
