@@ -65,31 +65,60 @@ jobs:
           head -20 "$PKG_DIR/Makefile"
 
           cat > "$PKG_DIR/Makefile" << 'MAKEFILE_EOF'
-      - name: Remove ALL QSDK Wi-Fi CLI packages
+      - name: Remove ALL QSDK packages from target.mk
         run: |
           set -e
           cd openwrt-src
 
-          for pkg in \
-            package/network/utils/qca-hostapd-cli \
-            package/network/utils/qca-wpa-cli \
-            package/network/utils/qca-wpa-supplicant-vendor \
-            package/network/utils/qca-hostap-vendor \
-            package/network/utils/qca-cfg80211tool-vendor \
-            package/network/utils/qca-cnss-daemon-vendor \
-            package/network/utils/qca-firmware-vendor \
-            package/network/utils/qca-ssdk-shell ; do
+          TARGET_MK="target/linux/ipq53xx/rd16/target.mk"
 
-            if [ -d "$pkg" ]; then
-              echo "Removing: $pkg"
-              rm -rf "$pkg"
-            else
-              echo "Not present: $pkg"
-            fi
+          echo "=== BEFORE ==="
+          grep -E "qca-|wififw|kmod-qca" "$TARGET_MK" || true
+
+          # Remove every QSDK-related package name from DEFAULT_PACKAGES.
+          # These come from vendor_feed, which is disabled in prepare_config.sh.
+          # Their kmod deps (e.g. kmod-qca-wifi-lowmem-profile-vendor) are missing,
+          # so opkg refuses to install them into the final image.
+          for pkg in \
+            kmod-qca-nss-ecm-wifi-plugin \
+            kmod-qca-nss-ppe-lag-mgr \
+            kmod-qca-nss-ppe-pppoe-mgr \
+            kmod-qca-nss-dp \
+            kmod-qca-nss-ppe-vp \
+            kmod-qca-nss-ppe-rule \
+            kmod-qca-nss-ppe-tun \
+            kmod-qca-nss-ppe-vlan-mgr \
+            kmod-qca-nss-ppe-bridge-mgr \
+            kmod-qca-nss-ppe-vxlanmgr \
+            kmod-qca-nss-sfe \
+            kmod-qca-nss-ecm-premium \
+            wififw_mount_script \
+            qca-cfg80211tool-vendor \
+            qca-cnss-daemon-vendor \
+            qca-firmware-vendor \
+            qca-hostap-vendor \
+            qca-hostapd-cli \
+            qca-wpa-cli \
+            qca-wpa-supplicant-vendor \
+            yt-9215s-client ; do
+
+            sed -i "s|${pkg}||g" "$TARGET_MK"
            done
 
-           echo "=== Remaining qca-* dirs in utils ==="
-           ls -la package/network/utils/ | grep qca || echo "none"
+           # Also nuke their CONFIG_ lines from .config (just in case)
+           for pkg in \
+             CONFIG_PACKAGE_kmod-qca-nss-ecm-wifi-plugin \
+             CONFIG_PACKAGE_wififw_mount_script \
+             CONFIG_PACKAGE_kmod-qca-wifi-lowmem-profile-vendor \
+             CONFIG_PACKAGE_qca-cfg80211tool-vendor \
+             CONFIG_PACKAGE_qca-cnss-daemon-vendor \
+             CONFIG_PACKAGE_qca-firmware-vendor ; do
+
+             sed -i "/${pkg}=/d" .config
+            done
+
+            echo "=== AFTER ==="
+            grep -E "qca-|wififw|kmod-qca" "$TARGET_MK" && echo "!!! still present !!!" || echo "OK: all QSDK packages removed"
 
       - name: Prepare config for RD16 (prebuild only, no QSDK)
         run: |
