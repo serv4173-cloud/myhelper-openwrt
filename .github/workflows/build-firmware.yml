@@ -56,29 +56,24 @@ jobs:
           echo "=== Target check ==="
           grep -E '^CONFIG_TARGET' .config | head -20
           
-      - name: Disable QSDK Wi-Fi CLI packages (hostapd 404 workaround)
+      - name: Remove QSDK Wi-Fi CLI packages from RD16 target
         run: |
           set -e
           cd openwrt-src
 
-          # These packages require hostapd-2022-09-19.tar.bz2, which is gone from
-          # all mirrors. Standard hostapd/wpa_supplicant from feeds is enough.
-          for pkg in qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor qca-hostap-vendor; do
-          echo "Disabling: PACKAGE_${pkg}"
-          ./scripts/config --file .config -d "PACKAGE_${pkg}" || true
-          done
+          # These packages need hostapd-2022-09-19.tar.bz2, gone from all mirrors.
+          # Remove from DEFAULT_PACKAGES so make defconfig won't re-add them.
+          TARGET_MK="target/linux/ipq53xx/rd16/target.mk"
 
-          # Regenerate config, keeping our disables
-          make defconfig
+          echo "=== BEFORE ==="
+          grep -n "qca-hostapd-cli\|qca-wpa-cli\|qca-wpa-supplicant-vendor\|qca-hostap-vendor" "$TARGET_MK" || true
 
-          echo "=== Verify QSDK CLI packages are DISABLED ==="
-          for pkg in qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor qca-hostap-vendor; do
-          if grep -qE "^CONFIG_PACKAGE_${pkg}=y" .config; then
-          echo "!!! ERROR: ${pkg} STILL ENABLED !!!"
-          else
-          echo "OK: ${pkg} disabled"
-          fi
-          done
+          sed -i 's/qca-hostapd-cli//g; s/qca-wpa-cli//g; s/qca-wpa-supplicant-vendor//g; s/qca-hostap-vendor//g' "$TARGET_MK"
+
+          echo "=== AFTER ==="
+          grep -n "qca-hostapd-cli\|qca-wpa-cli\|qca-wpa-supplicant-vendor\|qca-hostap-vendor" "$TARGET_MK" \
+          && echo "!!! still present !!!" \
+          || echo "OK: all removed from DEFAULT_PACKAGES"
 
       - name: Prepare feeds
         run: |
