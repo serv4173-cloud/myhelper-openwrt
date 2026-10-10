@@ -50,90 +50,57 @@ jobs:
           fi
 
       - name: Stub out qca-hostapd-cli (hostapd 404 workaround)
-  run: |
-    set -e
-    cd openwrt-src
+        run: |
+          set -e
+          cd openwrt-src
 
-    PKG_DIR="package/network/utils/qca-hostapd-cli"
-    if [ ! -d "$PKG_DIR" ]; then
-      echo "Package dir not found: $PKG_DIR"
-      ls -la package/network/utils/ | head -30
-      exit 1
-    fi
+          PKG_DIR="package/network/utils/qca-hostapd-cli"
+          if [ ! -d "$PKG_DIR" ]; then
+            echo "Package dir not found: $PKG_DIR"
+            ls -la package/network/utils/ | head -30
+            exit 1
+          fi
 
-    echo "=== Original Makefile (first 20 lines) ==="
-    head -20 "$PKG_DIR/Makefile"
+          echo "=== Original Makefile (first 20 lines) ==="
+          head -20 "$PKG_DIR/Makefile"
 
-    # Replace with stub: produces empty .ipk, no downloads, no build.
-    cat > "$PKG_DIR/Makefile" << 'EOF'
-    #
-    # Stub package: qca-hostapd-cli
-    # Original required hostapd-2022-09-19.tar.bz2, which is gone from all
-    # OpenWrt mirrors. This stub produces an empty .ipk so dependents still
-    # build. The hostapd_cli binary is NOT provided.
-    #
-    include $(TOPDIR)/rules.mk
+          cat > "$PKG_DIR/Makefile" << 'MAKEFILE_EOF'
+      - name: Remove qca-hostapd-cli package (hostapd 404 workaround)
+        run: |
+          set -e
+          cd openwrt-src
 
-    PKG_NAME:=qca-hostapd-cli
-    PKG_VERSION:=stub
-    PKG_RELEASE:=1
+          PKG_DIR="package/network/utils/qca-hostapd-cli"
+          if [ -d "$PKG_DIR" ]; then
+          echo "=== Original Makefile ==="
+          head -20 "$PKG_DIR/Makefile" || true
+          echo "=== Removing entire package directory ==="
+          rm -rf "$PKG_DIR"
+          echo "Removed: $PKG_DIR"
+          else
+          echo "Package not found, nothing to remove"
+          fi
 
-    include $(INCLUDE_DIR)/package.mk
+      - name: Prepare config for RD16 (prebuild only)
+        run: |
+          set -e
+          cd openwrt-src
+          chmod +x vendor_scripts/*.sh vendor_scripts/*.py 2>/dev/null || true
+          sh vendor_scripts/prepare_config.sh rd16
 
-    define Package/qca-hostapd-cli
-      SECTION:=net
-      CATEGORY:=Network
-      SUBMENU:=Wireless
-      TITLE:=QSDK hostapd_cli (STUBBED)
-      DEPENDS:=@TARGET_ipq53xx
-    endef
+          # Keep ONLY the prebuild profile (drop QSDK variants)
+          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config
+          sed -i '/CONFIG_PACKAGE_qca-hostapd-cli/d' .config
 
-    define Package/qca-hostapd-cli/description
-      Stubbed package. Original source is unavailable on OpenWrt mirrors.
-    endef
+          make defconfig
+          echo "=== Target check ==="
+          grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "no rd16 device profiles?"
 
-    define Build/Prepare
-    endef
-
-    define Build/Configure
-    endef
-
-    define Build/Compile
-    endef
-
-    define Package/qca-hostapd-cli/install
-      $(INSTALL_DIR) $(1)/usr/sbin
-      # Intentionally empty: no binary provided.
-    endef
-
-    $(eval $(call BuildPackage,qca-hostapd-cli))
-    EOF
-
-    echo "=== Stubbed Makefile (first 10 lines) ==="
-    head -10 "$PKG_DIR/Makefile"
-
-       - name: Prepare config for RD16 (prebuild only)
-   run: |
-    set -e
-    cd openwrt-src
-    chmod +x vendor_scripts/*.sh vendor_scripts/*.py 2>/dev/null || true
-    sh vendor_scripts/prepare_config.sh rd16
-
-    # Keep ONLY the prebuild profile (drop QSDK variants)
-    sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config
-    sed -i '/CONFIG_PACKAGE_qca-hostapd-cli/d' .config
-
-    make defconfig
-    echo "=== Target check ==="
-    grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "no rd16 device profiles?"
-          
       - name: Remove QSDK Wi-Fi CLI packages from RD16 target
         run: |
           set -e
           cd openwrt-src
 
-          # These packages need hostapd-2022-09-19.tar.bz2, gone from all mirrors.
-          # Remove from DEFAULT_PACKAGES so make defconfig won't re-add them.
           TARGET_MK="target/linux/ipq53xx/rd16/target.mk"
 
           echo "=== BEFORE ==="
@@ -143,8 +110,8 @@ jobs:
 
           echo "=== AFTER ==="
           grep -n "qca-hostapd-cli\|qca-wpa-cli\|qca-wpa-supplicant-vendor\|qca-hostap-vendor" "$TARGET_MK" \
-          && echo "!!! still present !!!" \
-          || echo "OK: all removed from DEFAULT_PACKAGES"
+            && echo "!!! still present !!!" \
+            || echo "OK: all removed from DEFAULT_PACKAGES"
 
       - name: Prepare feeds
         run: |
@@ -154,36 +121,25 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Enable myhelper + all runtime deps (embedded into firmware)
+      - name: Enable myhelper + all runtime deps
         run: |
           set -e
           cd openwrt-src
 
-          # Our package
-          echo "CONFIG_PACKAGE_myhelper=y" >> .config
- 
-          # Userspace tools needed at runtime (exec'd by the daemon)
-          echo "CONFIG_PACKAGE_nftables=y"       >> .config
-          echo "CONFIG_PACKAGE_tc=y"             >> .config
-          echo "CONFIG_PACKAGE_ethtool=y"        >> .config
-
-          # Kernel modules for CAKE shaping and IFB ingress
-          echo "CONFIG_PACKAGE_kmod-sched-cake=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-ifb=y"        >> .config
-          echo "CONFIG_PACKAGE_kmod-nft-core=y"   >> .config
-
-          # BBR congestion control (needed for the BBR toggle)
-          echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"    >> .config
+          echo "CONFIG_PACKAGE_myhelper=y"             >> .config
+          echo "CONFIG_PACKAGE_nftables=y"            >> .config
+          echo "CONFIG_PACKAGE_tc=y"                  >> .config
+          echo "CONFIG_PACKAGE_ethtool=y"             >> .config
+          echo "CONFIG_PACKAGE_kmod-sched-cake=y"     >> .config
+          echo "CONFIG_PACKAGE_kmod-ifb=y"            >> .config
+          echo "CONFIG_PACKAGE_kmod-nft-core=y"       >> .config
+          echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"        >> .config
 
           make defconfig
 
           echo "=== Verify embedded packages ==="
-          grep -E '^CONFIG_PACKAGE_(myhelper|nftables|tc|kmod-sched-cake|kmod-ifb|kmod-tcp-bbr|kmod-nft-core)=' .config
-
-  
+          grep -E '^CONFIG_PACKAGE_(myhelper|nftables|tc|kmod-sched-cake|kmod-ifb|kmod-tcp-bbr|kmod-nft-core)=' .config || true
           grep -E '^CONFIG_PACKAGE_myhelper' .config || echo "!!! NOT IN CONFIG !!!"
-          grep -E '^CONFIG_TARGET_arch=' .config || true
-          grep -E '^CONFIG_TARGET_ipq53xx' .config | head -10
 
       - name: Build kmod toolchain (GCC 7.5.0 for kernel)
         run: |
@@ -195,7 +151,6 @@ jobs:
         run: |
           set -e
           cd openwrt-src
-          # First try parallel build; fallback to serial if it OOMs
           make -j$(nproc) V=s || {
             echo "=== Parallel build failed, retrying with -j1 ==="
             make -j1 V=s
@@ -205,20 +160,14 @@ jobs:
         run: |
           set -e
           mkdir -p output
-
-          # Firmware images (flashable)
           find openwrt-src/bin/targets -name '*sysupgrade*.bin' -exec cp -v {} output/ \; || true
           find openwrt-src/bin/targets -name '*factory*.bin'  -exec cp -v {} output/ \; || true
           find openwrt-src/bin/targets -name '*factory*.ubi'  -exec cp -v {} output/ \; || true
           find openwrt-src/bin/targets -name '*initramfs*'    -exec cp -v {} output/ \; || true
           find openwrt-src/bin/targets -name '*.itb'          -exec cp -v {} output/ \; || true
-
-          # myhelper .ipk as fallback (if user wants to install later)
           find openwrt-src/bin -name 'myhelper*.ipk' -exec cp -v {} output/ \; || true
-
           echo "=== output contents ==="
           ls -la output/
-
           if [ -z "$(ls -A output)" ]; then
             echo "ERROR: no images produced"
             find openwrt-src/bin/targets -maxdepth 4 -type f | head -40
