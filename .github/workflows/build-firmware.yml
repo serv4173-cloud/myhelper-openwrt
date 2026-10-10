@@ -65,23 +65,33 @@ jobs:
           head -20 "$PKG_DIR/Makefile"
 
           cat > "$PKG_DIR/Makefile" << 'MAKEFILE_EOF'
-      - name: Remove qca-hostapd-cli package (hostapd 404 workaround)
+      - name: Remove ALL QSDK Wi-Fi CLI packages
         run: |
           set -e
           cd openwrt-src
 
-          PKG_DIR="package/network/utils/qca-hostapd-cli"
-          if [ -d "$PKG_DIR" ]; then
-          echo "=== Original Makefile ==="
-          head -20 "$PKG_DIR/Makefile" || true
-          echo "=== Removing entire package directory ==="
-          rm -rf "$PKG_DIR"
-          echo "Removed: $PKG_DIR"
-          else
-          echo "Package not found, nothing to remove"
-          fi
+          for pkg in \
+            package/network/utils/qca-hostapd-cli \
+            package/network/utils/qca-wpa-cli \
+            package/network/utils/qca-wpa-supplicant-vendor \
+            package/network/utils/qca-hostap-vendor \
+            package/network/utils/qca-cfg80211tool-vendor \
+            package/network/utils/qca-cnss-daemon-vendor \
+            package/network/utils/qca-firmware-vendor \
+            package/network/utils/qca-ssdk-shell ; do
 
-      - name: Prepare config for RD16 (prebuild only)
+            if [ -d "$pkg" ]; then
+              echo "Removing: $pkg"
+              rm -rf "$pkg"
+            else
+              echo "Not present: $pkg"
+            fi
+           done
+
+           echo "=== Remaining qca-* dirs in utils ==="
+           ls -la package/network/utils/ | grep qca || echo "none"
+
+      - name: Prepare config for RD16 (prebuild only, no QSDK)
         run: |
           set -e
           cd openwrt-src
@@ -90,11 +100,23 @@ jobs:
 
           # Keep ONLY the prebuild profile (drop QSDK variants)
           sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config
+
+          # Remove ALL QSDK Wi-Fi CLI package selections
           sed -i '/CONFIG_PACKAGE_qca-hostapd-cli/d' .config
+          sed -i '/CONFIG_PACKAGE_qca-wpa-cli/d' .config
+          sed -i '/CONFIG_PACKAGE_qca-wpa-supplicant-vendor/d' .config
+          sed -i '/CONFIG_PACKAGE_qca-hostap-vendor/d' .config
 
           make defconfig
           echo "=== Target check ==="
           grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "no rd16 device profiles?"
+          echo "=== QSDK CLI check ==="
+          if grep -qE 'CONFIG_PACKAGE_qca-(hostapd|wpa)-cli=y' .config; then
+            echo "!!! QSDK CLI still enabled !!!"
+            grep -E 'CONFIG_PACKAGE_qca-(hostapd|wpa)-cli' .config
+          else
+            echo "OK: no QSDK CLI in .config"
+          fi
 
       - name: Remove QSDK Wi-Fi CLI packages from RD16 target
         run: |
