@@ -64,13 +64,33 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Enable myhelper (embedded into firmware)
+      - name: Enable myhelper + all runtime deps (embedded into firmware)
         run: |
           set -e
           cd openwrt-src
-          # Embed myhelper into firmware image AND keep .ipk as fallback
+
+          # Our package
           echo "CONFIG_PACKAGE_myhelper=y" >> .config
+ 
+          # Userspace tools needed at runtime (exec'd by the daemon)
+          echo "CONFIG_PACKAGE_nftables=y"       >> .config
+          echo "CONFIG_PACKAGE_tc=y"             >> .config
+          echo "CONFIG_PACKAGE_ethtool=y"        >> .config
+
+          # Kernel modules for CAKE shaping and IFB ingress
+          echo "CONFIG_PACKAGE_kmod-sched-cake=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-ifb=y"        >> .config
+          echo "CONFIG_PACKAGE_kmod-nft-core=y"   >> .config
+
+          # BBR congestion control (needed for the BBR toggle)
+          echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"    >> .config
+
           make defconfig
+
+          echo "=== Verify embedded packages ==="
+          grep -E '^CONFIG_PACKAGE_(myhelper|nftables|tc|kmod-sched-cake|kmod-ifb|kmod-tcp-bbr|kmod-nft-core)=' .config
+
+  
           grep -E '^CONFIG_PACKAGE_myhelper' .config || echo "!!! NOT IN CONFIG !!!"
           grep -E '^CONFIG_TARGET_arch=' .config || true
           grep -E '^CONFIG_TARGET_ipq53xx' .config | head -10
