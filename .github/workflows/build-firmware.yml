@@ -47,14 +47,41 @@ jobs:
             echo "OK: no leading spaces"
           fi
 
-      - name: Prepare config for RD16
+      - name: Prepare config for RD16 (prebuild only, no QSDK)
         run: |
           set -e
           cd openwrt-src
           chmod +x vendor_scripts/*.sh vendor_scripts/*.py 2>/dev/null || true
+
+          # Let RomikB create the base config (it enables all 4 RD16 profiles)
           sh vendor_scripts/prepare_config.sh rd16
+
+          # We keep ONLY the prebuild profile (stock kernel, no QSDK Wi-Fi).
+          # QSDK profiles pull qca-hostapd-cli which needs hostapd-2022-09-19.tar.bz2
+          # (404 on ALL mirrors). Drop them.
+          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config
+          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk-podkop/d' .config
+          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-prebuild-podkop/d' .config
+
+          # Also nuke any explicit selection of the QSDK Wi-Fi CLI packages
+          sed -i '/CONFIG_PACKAGE_qca-hostapd-cli/d' .config
+          sed -i '/CONFIG_PACKAGE_qca-wpa-cli/d' .config
+          sed -i '/CONFIG_PACKAGE_qca-wpa-supplicant-vendor/d' .config
+          sed -i '/CONFIG_PACKAGE_qca-hostap-vendor/d' .config
+
+          # Regenerate .config
+          make defconfig
+
           echo "=== Target check ==="
-          grep -E '^CONFIG_TARGET' .config | head -20
+          grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "no rd16 device profiles?"
+
+          echo "=== QSDK CLI check ==="
+          if grep -qE 'CONFIG_PACKAGE_(qca-hostapd-cli|qca-wpa-cli|qca-wpa-supplicant-vendor|qca-hostap-vendor)=y' .config; then
+          echo "!!! ERROR: QSDK CLI still enabled in .config !!!"
+          grep -E 'CONFIG_PACKAGE_(qca-hostapd-cli|qca-wpa-cli)' .config
+          else
+          echo "OK: no QSDK CLI packages in .config"
+          fi
           
       - name: Remove QSDK Wi-Fi CLI packages from RD16 target
         run: |
