@@ -47,41 +47,83 @@ jobs:
             echo "OK: no leading spaces"
           fi
 
-      - name: Prepare config for RD16 (prebuild only, no QSDK)
-        run: |
-          set -e
-          cd openwrt-src
-          chmod +x vendor_scripts/*.sh vendor_scripts/*.py 2>/dev/null || true
+      - name: Stub out qca-hostapd-cli (hostapd 404 workaround)
+  run: |
+    set -e
+    cd openwrt-src
 
-          # Let RomikB create the base config (it enables all 4 RD16 profiles)
-          sh vendor_scripts/prepare_config.sh rd16
+    PKG_DIR="package/network/utils/qca-hostapd-cli"
+    if [ ! -d "$PKG_DIR" ]; then
+      echo "Package dir not found: $PKG_DIR"
+      ls -la package/network/utils/ | head -30
+      exit 1
+    fi
 
-          # We keep ONLY the prebuild profile (stock kernel, no QSDK Wi-Fi).
-          # QSDK profiles pull qca-hostapd-cli which needs hostapd-2022-09-19.tar.bz2
-          # (404 on ALL mirrors). Drop them.
-          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config
-          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk-podkop/d' .config
-          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-prebuild-podkop/d' .config
+    echo "=== Original Makefile (first 20 lines) ==="
+    head -20 "$PKG_DIR/Makefile"
 
-          # Also nuke any explicit selection of the QSDK Wi-Fi CLI packages
-          sed -i '/CONFIG_PACKAGE_qca-hostapd-cli/d' .config
-          sed -i '/CONFIG_PACKAGE_qca-wpa-cli/d' .config
-          sed -i '/CONFIG_PACKAGE_qca-wpa-supplicant-vendor/d' .config
-          sed -i '/CONFIG_PACKAGE_qca-hostap-vendor/d' .config
+    # Replace with stub: produces empty .ipk, no downloads, no build.
+    cat > "$PKG_DIR/Makefile" << 'EOF'
+    #
+    # Stub package: qca-hostapd-cli
+    # Original required hostapd-2022-09-19.tar.bz2, which is gone from all
+    # OpenWrt mirrors. This stub produces an empty .ipk so dependents still
+    # build. The hostapd_cli binary is NOT provided.
+    #
+    include $(TOPDIR)/rules.mk
 
-          # Regenerate .config
-          make defconfig
+    PKG_NAME:=qca-hostapd-cli
+    PKG_VERSION:=stub
+    PKG_RELEASE:=1
 
-          echo "=== Target check ==="
-          grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "no rd16 device profiles?"
+    include $(INCLUDE_DIR)/package.mk
 
-          echo "=== QSDK CLI check ==="
-          if grep -qE 'CONFIG_PACKAGE_(qca-hostapd-cli|qca-wpa-cli|qca-wpa-supplicant-vendor|qca-hostap-vendor)=y' .config; then
-          echo "!!! ERROR: QSDK CLI still enabled in .config !!!"
-          grep -E 'CONFIG_PACKAGE_(qca-hostapd-cli|qca-wpa-cli)' .config
-          else
-          echo "OK: no QSDK CLI packages in .config"
-          fi
+    define Package/qca-hostapd-cli
+      SECTION:=net
+      CATEGORY:=Network
+      SUBMENU:=Wireless
+      TITLE:=QSDK hostapd_cli (STUBBED)
+      DEPENDS:=@TARGET_ipq53xx
+    endef
+
+    define Package/qca-hostapd-cli/description
+      Stubbed package. Original source is unavailable on OpenWrt mirrors.
+    endef
+
+    define Build/Prepare
+    endef
+
+    define Build/Configure
+    endef
+
+    define Build/Compile
+    endef
+
+    define Package/qca-hostapd-cli/install
+      $(INSTALL_DIR) $(1)/usr/sbin
+      # Intentionally empty: no binary provided.
+    endef
+
+    $(eval $(call BuildPackage,qca-hostapd-cli))
+    EOF
+
+    echo "=== Stubbed Makefile (first 10 lines) ==="
+    head -10 "$PKG_DIR/Makefile"
+
+       - name: Prepare config for RD16 (prebuild only)
+   run: |
+    set -e
+    cd openwrt-src
+    chmod +x vendor_scripts/*.sh vendor_scripts/*.py 2>/dev/null || true
+    sh vendor_scripts/prepare_config.sh rd16
+
+    # Keep ONLY the prebuild profile (drop QSDK variants)
+    sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config
+    sed -i '/CONFIG_PACKAGE_qca-hostapd-cli/d' .config
+
+    make defconfig
+    echo "=== Target check ==="
+    grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "no rd16 device profiles?"
           
       - name: Remove QSDK Wi-Fi CLI packages from RD16 target
         run: |
