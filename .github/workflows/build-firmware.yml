@@ -107,17 +107,22 @@ jobs:
           echo "=== AFTER ==="
           grep -E "qca-|wififw|kmod-qca" "$TARGET_MK" && echo "!!! still present !!!" || echo "OK: all QSDK packages removed from target.mk"
 
-      - name: Prepare config for RD16 (prebuild only, no QSDK)
+      - name: Prepare config for RD16 (QSQK kernel)
         run: |
           set -e
           cd openwrt-src
           chmod +x vendor_scripts/*.sh vendor_scripts/*.py 2>/dev/null || true
           sh vendor_scripts/prepare_config.sh rd16
 
-          # Keep ONLY the prebuild profile (drop QSDK variants)
-          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config
+          # Prebuild devices need 'kernel' file that RomikB forgot to commit.
+          # Remove all prebuild profiles — they will fail on missing file.
+          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-prebuild/d' .config
 
-          # Also remove any explicit QSDK package selections from .config
+          # Keep only QSDK profiles (build kernel from codelinaro source).
+          # Drop qsdk-podkop to keep image lean.
+          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk-podkop/d' .config
+
+          # Remove explicit QSDK Wi-Fi CLI package selections
           for pkg in \
             qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor \
             qca-hostap-vendor qca-cfg80211tool-vendor qca-cnss-daemon-vendor \
@@ -129,15 +134,14 @@ jobs:
 
           make defconfig
 
-          echo "=== Target check ==="
-          grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "no rd16 device profiles?"
-
-          echo "=== QSDK check ==="
-          if grep -qE 'CONFIG_PACKAGE_(qca-|kmod-qca-|wififw_)' .config; then
-            echo "!!! QSDK still enabled in .config !!!"
-            grep -E 'CONFIG_PACKAGE_(qca-|kmod-qca-|wififw_)' .config
+          echo "=== Active RD16 device profiles ==="
+          grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "!!! NO DEVICES !!!"
+          echo "=== QSDK check (only =y lines) ==="
+          if grep -qE '^CONFIG_PACKAGE_(qca-|kmod-qca-|wififw_)' .config; then
+            echo "!!! QSDK still ACTIVE in .config !!!"
+            grep -E '^CONFIG_PACKAGE_(qca-|kmod-qca-|wififw_)' .config
           else
-            echo "OK: no QSDK packages in .config"
+            echo "OK: no QSDK packages active in .config"
           fi
 
       - name: Remove QSDK Wi-Fi CLI packages from RD16 target
