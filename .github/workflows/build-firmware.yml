@@ -76,9 +76,7 @@ jobs:
           grep -E "qca-|wififw|kmod-qca" "$TARGET_MK" || true
 
           # Remove every QSDK-related package name from DEFAULT_PACKAGES.
-          # These come from vendor_feed, which is disabled in prepare_config.sh.
-          # Their kmod deps (e.g. kmod-qca-wifi-lowmem-profile-vendor) are missing,
-          # so opkg refuses to install them into the final image.
+          # These come from vendor_feed (disabled) so their kmod deps are missing.
           for pkg in \
             kmod-qca-nss-ecm-wifi-plugin \
             kmod-qca-nss-ppe-lag-mgr \
@@ -100,25 +98,14 @@ jobs:
             qca-hostapd-cli \
             qca-wpa-cli \
             qca-wpa-supplicant-vendor \
+            qca-ssdk-shell \
             yt-9215s-client ; do
-
+            
             sed -i "s|${pkg}||g" "$TARGET_MK"
-           done
+          done
 
-           # Also nuke their CONFIG_ lines from .config (just in case)
-           for pkg in \
-             CONFIG_PACKAGE_kmod-qca-nss-ecm-wifi-plugin \
-             CONFIG_PACKAGE_wififw_mount_script \
-             CONFIG_PACKAGE_kmod-qca-wifi-lowmem-profile-vendor \
-             CONFIG_PACKAGE_qca-cfg80211tool-vendor \
-             CONFIG_PACKAGE_qca-cnss-daemon-vendor \
-             CONFIG_PACKAGE_qca-firmware-vendor ; do
-
-             sed -i "/${pkg}=/d" .config
-            done
-
-            echo "=== AFTER ==="
-            grep -E "qca-|wififw|kmod-qca" "$TARGET_MK" && echo "!!! still present !!!" || echo "OK: all QSDK packages removed"
+          echo "=== AFTER ==="
+          grep -E "qca-|wififw|kmod-qca" "$TARGET_MK" && echo "!!! still present !!!" || echo "OK: all QSDK packages removed from target.mk"
 
       - name: Prepare config for RD16 (prebuild only, no QSDK)
         run: |
@@ -130,21 +117,27 @@ jobs:
           # Keep ONLY the prebuild profile (drop QSDK variants)
           sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config
 
-          # Remove ALL QSDK Wi-Fi CLI package selections
-          sed -i '/CONFIG_PACKAGE_qca-hostapd-cli/d' .config
-          sed -i '/CONFIG_PACKAGE_qca-wpa-cli/d' .config
-          sed -i '/CONFIG_PACKAGE_qca-wpa-supplicant-vendor/d' .config
-          sed -i '/CONFIG_PACKAGE_qca-hostap-vendor/d' .config
+          # Also remove any explicit QSDK package selections from .config
+          for pkg in \
+            qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor \
+            qca-hostap-vendor qca-cfg80211tool-vendor qca-cnss-daemon-vendor \
+            qca-firmware-vendor wififw_mount_script qca-ssdk-shell \
+            kmod-qca-nss-ecm-wifi-plugin kmod-qca-wifi-lowmem-profile-vendor ; do
+
+            sed -i "/CONFIG_PACKAGE_${pkg}=/d" .config
+          done
 
           make defconfig
+
           echo "=== Target check ==="
           grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "no rd16 device profiles?"
-          echo "=== QSDK CLI check ==="
-          if grep -qE 'CONFIG_PACKAGE_qca-(hostapd|wpa)-cli=y' .config; then
-            echo "!!! QSDK CLI still enabled !!!"
-            grep -E 'CONFIG_PACKAGE_qca-(hostapd|wpa)-cli' .config
+
+          echo "=== QSDK check ==="
+          if grep -qE 'CONFIG_PACKAGE_(qca-|kmod-qca-|wififw_)' .config; then
+            echo "!!! QSDK still enabled in .config !!!"
+            grep -E 'CONFIG_PACKAGE_(qca-|kmod-qca-|wififw_)' .config
           else
-            echo "OK: no QSDK CLI in .config"
+            echo "OK: no QSDK packages in .config"
           fi
 
       - name: Remove QSDK Wi-Fi CLI packages from RD16 target
