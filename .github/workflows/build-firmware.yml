@@ -20,7 +20,7 @@ jobs:
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
             python3 python3-setuptools python3-pip rsync subversion swig time \
             unzip zlib1g-dev file wget bc libelf-dev cpio aria2 squashfs-tools
-          pip install --quiet ubi_reader
+          pip install --quiet ubi_reader pyelftools capstone
 
       - name: Verify tools
         run: |
@@ -101,19 +101,29 @@ jobs:
 
       - name: Remove QSDK packages from target.mk
         run: |
-          set -e
+          set -e   
           cd openwrt-src
           TARGET_MK="target/linux/ipq53xx/rd16/target.mk"
+  
+          # Remove ONLY packages that literally fail to build (missing 404 sources).
+          # KEEP Wi-Fi drivers: kmod-qca-wifi-*, qca-wifi-scripts, wififw_mount_script
+          # KEEP kmod-qca-nss-* drivers (except ecm-wifi-plugin which needs missing dep).
           for pkg in \
-            kmod-qca-nss-ecm-wifi-plugin kmod-qca-nss-ppe-lag-mgr \
-            kmod-qca-nss-ppe-pppoe-mgr wififw_mount_script \
-            qca-cfg80211tool-vendor qca-cnss-daemon-vendor \
-            qca-firmware-vendor qca-hostap-vendor qca-hostapd-cli \
-            qca-wpa-cli qca-wpa-supplicant-vendor qca-ssdk-shell \
+            qca-hostapd-cli \
+            qca-wpa-cli \
+            qca-wpa-supplicant-vendor \
+            qca-hostap-vendor \
+            qca-cfg80211tool-vendor \
+            qca-cnss-daemon-vendor \
+            qca-firmware-vendor \
+            qca-ssdk-shell \
+            kmod-qca-nss-ecm-wifi-plugin \
             yt-9215s-client ; do
             sed -i "s|${pkg}||g" "$TARGET_MK"
           done
-          grep -E "qca-|wififw" "$TARGET_MK" && echo "!!! still present !!!" || echo "OK: QSDK removed"
+
+          echo "=== After removal ==="
+          grep -E "qca-|wififw|kmod-qca" "$TARGET_MK" || echo "no QSDK packages left"
 
       - name: Feeds update + patch + install
         run: |
