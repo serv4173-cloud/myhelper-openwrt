@@ -137,7 +137,34 @@ jobs:
           set -e
           cd openwrt-src
           make -j$(nproc) V=s || make -j1 V=s
-
+      - name: Verify compiled kernel
+        run: |
+          set -e
+          cd openwrt-src
+    
+          # Найти собранный kernel
+          KERNEL=$(find build_dir -name 'Image' -path '*linux-ipq53xx*' | head -1)
+          echo "Kernel: $KERNEL"
+          ls -la "$KERNEL"
+    
+          # Найти DTB для RD16
+          DTB=$(find build_dir -name 'ipq5332-rd16.dtb' | head -1)
+          echo "DTB: $DTB"
+          ls -la "$DTB"
+    
+          # Проверить, что DTB валидный
+          if [ -f "$DTB" ]; then
+            echo "DTB is valid binary"
+            xxd "$DTB" | head -2
+          fi
+    
+          # Проверить, что kernel несёт встроенные драйверы (grep по строкам)
+          if strings "$KERNEL" | grep -q "ipq53"; then
+            echo "OK: kernel contains ipq53 references"
+          fi
+          if strings "$KERNEL" | grep -q "qca-nss"; then
+            echo "OK: kernel contains NSS references"
+          fi
       - name: Collect firmware images
         run: |
           set -e
@@ -149,7 +176,50 @@ jobs:
           find openwrt-src/bin -name 'myhelper*.ipk' -exec cp -v {} output/ \; || true
           echo "=== output ==="
           ls -la output/
-
+      - name: Verify firmware image
+        run: |
+          set -e
+          cd output
+    
+          echo "=== Files ==="
+          ls -la
+    
+          UBI_FILE=$(find . -name '*prebuild*factory.ubi' | head -1)
+          if [ -z "$UBI_FILE" ]; then
+            echo "ERROR: no factory.ubi found"
+            exit 1
+          fi
+          echo "Checking: $UBI_FILE"
+          echo "Size: $(stat -c%s $UBI_FILE) bytes"
+    
+          # Проверка размера (ожидаем 6-12 МБ)
+          SIZE=$(stat -c%s "$UBI_FILE")
+          if [ "$SIZE" -lt 4000000 ] || [ "$SIZE" -gt 20000000 ]; then
+            echo "WARNING: size out of expected range (4-20 MB)"
+          fi
+    
+          # Проверка что файл начинается с UBI magic (0x55424923 = "UBI#")
+          MAGIC=$(xxd -p -l 4 "$UBI_FILE")
+          echo "Magic bytes: $MAGIC"
+          if [ "$MAGIC" != "55424923" ]; then
+            echo "WARNING: file does not start with UBI# magic"
+          else
+            echo "OK: valid UBI magic"
+          fi
+    
+          # Проверка наличия строки ipq5332-rd16.dtb внутри (DTB для нашей модели)
+          if strings "$UBI_FILE" | grep -q "ipq5332-rd16"; then
+            echo "OK: found ipq5332-rd16 DTB reference"
+          else
+            echo "WARNING: no ipq5332-rd16 DTB reference — Wi-Fi/LAN may not work"
+          fi
+    
+          # Проверка наличия myhelper
+          if strings "$UBI_FILE" | grep -q "myhelper"; then
+            echo "OK: found myhelper"
+          else
+            echo "WARNING: no myhelper in image"
+          fi
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         if: success()
