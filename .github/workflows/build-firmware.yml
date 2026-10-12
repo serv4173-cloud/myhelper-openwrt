@@ -1,4 +1,4 @@
-name: Build RD16 firmware
+name: Build RD16 firmware (prebuild)
 
 on:
   push:
@@ -27,8 +27,20 @@ jobs:
           git clone --depth 1 --branch openwrt-24-rd15 \
             https://github.com/RomikB/openwrt.git openwrt-src
           cd openwrt-src
-          echo "=== vendor_scripts ==="
           ls -la vendor_scripts/
+
+      - name: Download stock firmware for kernel extraction
+        run: |
+          set -e
+          cd openwrt-src
+          # !!! ЗАМЕНИ URL НА СВОЮ ССЫЛКУ ИЗ RELEASE !!!
+          STOCK_URL="https://github.com/serv4173-cloud/myhelper-openwrt/releases/download/stock-1.0.31/miwifi_rd16_firmware_87da2_1.0.31.bin"
+          echo "Downloading stock firmware from $STOCK_URL"
+          curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 600 \
+            -o miwifi_rd16_firmware_87da2_1.0.31.bin "$STOCK_URL"
+          ls -la miwifi_rd16_firmware_87da2_1.0.31.bin
+          # Версия для совместимости с prepare_feed.sh (он ищет rd15)
+          cp miwifi_rd16_firmware_87da2_1.0.31.bin miwifi_rd15_firmware_stub.bin || true
 
       - name: Copy myhelper into source tree
         run: |
@@ -43,137 +55,66 @@ jobs:
           FILE="openwrt-src/package/myhelper/Makefile"
           sed -i 's/^    /\t/' "$FILE"
           grep -nP '^\t' "$FILE" | head -10 | cat -A
-          if grep -qP '^ ' "$FILE"; then
-            echo "WARNING: leading spaces remain"
-          else
-            echo "OK: no leading spaces"
-          fi
 
-      - name: Stub out qca-hostapd-cli (hostapd 404 workaround)
+      - name: Prepare feeds (extracts vendor kernel)
         run: |
           set -e
           cd openwrt-src
-
-          PKG_DIR="package/network/utils/qca-hostapd-cli"
-          if [ ! -d "$PKG_DIR" ]; then
-            echo "Package dir not found: $PKG_DIR"
-            ls -la package/network/utils/ | head -30
-            exit 1
+          echo "=== Running prepare_feed.sh ==="
+          sh vendor_scripts/prepare_feed.sh
+          echo "=== Checking extracted kernel ==="
+          ls -la target/linux/ipq53xx/rd15/kernel 2>/dev/null || echo "NO rd15 kernel"
+          ls -la target/linux/ipq53xx/rd16/kernel 2>/dev/null || echo "NO rd16 kernel"
+          # Если rd16 kernel нет — копируем из rd15
+          if [ ! -f target/linux/ipq53xx/rd16/kernel ] && [ -f target/linux/ipq53xx/rd15/kernel ]; then
+            cp target/linux/ipq53xx/rd15/kernel target/linux/ipq53xx/rd16/kernel
+            echo "Copied rd15 kernel to rd16"
           fi
+          ls -la target/linux/ipq53xx/rd16/kernel
 
-          echo "=== Original Makefile (first 20 lines) ==="
-          head -20 "$PKG_DIR/Makefile"
-
-          cat > "$PKG_DIR/Makefile" << 'MAKEFILE_EOF'
-      - name: Remove ALL QSDK packages from target.mk
-        run: |
-          set -e
-          cd openwrt-src
-
-          TARGET_MK="target/linux/ipq53xx/rd16/target.mk"
-
-          echo "=== BEFORE ==="
-          grep -E "qca-|wififw|kmod-qca" "$TARGET_MK" || true
-
-          # Remove every QSDK-related package name from DEFAULT_PACKAGES.
-          # These come from vendor_feed (disabled) so their kmod deps are missing.
-          for pkg in \
-            kmod-qca-nss-ecm-wifi-plugin \
-            kmod-qca-nss-ppe-lag-mgr \
-            kmod-qca-nss-ppe-pppoe-mgr \
-            kmod-qca-nss-dp \
-            kmod-qca-nss-ppe-vp \
-            kmod-qca-nss-ppe-rule \
-            kmod-qca-nss-ppe-tun \
-            kmod-qca-nss-ppe-vlan-mgr \
-            kmod-qca-nss-ppe-bridge-mgr \
-            kmod-qca-nss-ppe-vxlanmgr \
-            kmod-qca-nss-sfe \
-            kmod-qca-nss-ecm-premium \
-            wififw_mount_script \
-            qca-cfg80211tool-vendor \
-            qca-cnss-daemon-vendor \
-            qca-firmware-vendor \
-            qca-hostap-vendor \
-            qca-hostapd-cli \
-            qca-wpa-cli \
-            qca-wpa-supplicant-vendor \
-            qca-ssdk-shell \
-            yt-9215s-client ; do
-            
-            sed -i "s|${pkg}||g" "$TARGET_MK"
-          done
-
-          echo "=== AFTER ==="
-          grep -E "qca-|wififw|kmod-qca" "$TARGET_MK" && echo "!!! still present !!!" || echo "OK: all QSDK packages removed from target.mk"
-
-      - name: Prepare config for RD16 (QSQK kernel)
+      - name: Prepare config for RD16 (prebuild)
         run: |
           set -e
           cd openwrt-src
           chmod +x vendor_scripts/*.sh vendor_scripts/*.py 2>/dev/null || true
           sh vendor_scripts/prepare_config.sh rd16
 
-          # Prebuild devices need 'kernel' file that RomikB forgot to commit.
-          # Remove all prebuild profiles — they will fail on missing file.
-          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-prebuild/d' .config
-
-          # Keep only QSDK profiles (build kernel from codelinaro source).
-          # Drop qsdk-podkop to keep image lean.
+          # Оставляем ТОЛЬКО prebuild (убираем QSDK — он ломает сеть)
+          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config
           sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk-podkop/d' .config
-
-          # Remove explicit QSDK Wi-Fi CLI package selections
-          for pkg in \
-            qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor \
-            qca-hostap-vendor qca-cfg80211tool-vendor qca-cnss-daemon-vendor \
-            qca-firmware-vendor wififw_mount_script qca-ssdk-shell \
-            kmod-qca-nss-ecm-wifi-plugin kmod-qca-wifi-lowmem-profile-vendor ; do
-
-            sed -i "/CONFIG_PACKAGE_${pkg}=/d" .config
-          done
 
           make defconfig
 
-          echo "=== Active RD16 device profiles ==="
+          echo "=== Active devices ==="
           grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "!!! NO DEVICES !!!"
-          echo "=== QSDK check (only =y lines) ==="
-          if grep -qE '^CONFIG_PACKAGE_(qca-|kmod-qca-|wififw_)' .config; then
-            echo "!!! QSDK still ACTIVE in .config !!!"
-            grep -E '^CONFIG_PACKAGE_(qca-|kmod-qca-|wififw_)' .config
-          else
-            echo "OK: no QSDK packages active in .config"
-          fi
 
-      - name: Remove QSDK Wi-Fi CLI packages from RD16 target
+      - name: Remove QSDK packages from target.mk
         run: |
           set -e
           cd openwrt-src
-
           TARGET_MK="target/linux/ipq53xx/rd16/target.mk"
+          for pkg in \
+            kmod-qca-nss-ecm-wifi-plugin kmod-qca-nss-ppe-lag-mgr \
+            kmod-qca-nss-ppe-pppoe-mgr wififw_mount_script \
+            qca-cfg80211tool-vendor qca-cnss-daemon-vendor \
+            qca-firmware-vendor qca-hostap-vendor qca-hostapd-cli \
+            qca-wpa-cli qca-wpa-supplicant-vendor qca-ssdk-shell \
+            yt-9215s-client ; do
+            sed -i "s|${pkg}||g" "$TARGET_MK"
+          done
+          grep -E "qca-|wififw" "$TARGET_MK" && echo "!!! still present !!!" || echo "OK: QSDK removed"
 
-          echo "=== BEFORE ==="
-          grep -n "qca-hostapd-cli\|qca-wpa-cli\|qca-wpa-supplicant-vendor\|qca-hostap-vendor" "$TARGET_MK" || true
-
-          sed -i 's/qca-hostapd-cli//g; s/qca-wpa-cli//g; s/qca-wpa-supplicant-vendor//g; s/qca-hostap-vendor//g' "$TARGET_MK"
-
-          echo "=== AFTER ==="
-          grep -n "qca-hostapd-cli\|qca-wpa-cli\|qca-wpa-supplicant-vendor\|qca-hostap-vendor" "$TARGET_MK" \
-            && echo "!!! still present !!!" \
-            || echo "OK: all removed from DEFAULT_PACKAGES"
-
-      - name: Prepare feeds
+      - name: Prepare feeds install
         run: |
           set -e
           cd openwrt-src
-          sh vendor_scripts/prepare_feed.sh || true
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Enable myhelper + all runtime deps
+      - name: Enable myhelper + runtime deps
         run: |
           set -e
           cd openwrt-src
-
           echo "CONFIG_PACKAGE_myhelper=y"             >> .config
           echo "CONFIG_PACKAGE_nftables=y"            >> .config
           echo "CONFIG_PACKAGE_tc=y"                  >> .config
@@ -182,51 +123,38 @@ jobs:
           echo "CONFIG_PACKAGE_kmod-ifb=y"            >> .config
           echo "CONFIG_PACKAGE_kmod-nft-core=y"       >> .config
           echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"        >> .config
-
           make defconfig
-
-          echo "=== Verify embedded packages ==="
           grep -E '^CONFIG_PACKAGE_(myhelper|nftables|tc|kmod-sched-cake|kmod-ifb|kmod-tcp-bbr|kmod-nft-core)=' .config || true
-          grep -E '^CONFIG_PACKAGE_myhelper' .config || echo "!!! NOT IN CONFIG !!!"
 
-      - name: Build kmod toolchain (GCC 7.5.0 for kernel)
+      - name: Build kmod toolchain (GCC 7.5.0)
         run: |
           set -e
           cd openwrt-src
           bash vendor_scripts/build_kmod_toolchain.sh
 
-      - name: Build full firmware (this takes 3-5 hours)
+      - name: Build full firmware
         run: |
           set -e
           cd openwrt-src
-          make -j$(nproc) V=s || {
-            echo "=== Parallel build failed, retrying with -j1 ==="
-            make -j1 V=s
-          }
+          make -j$(nproc) V=s || make -j1 V=s
 
       - name: Collect firmware images
         run: |
           set -e
           mkdir -p output
           find openwrt-src/bin/targets -name '*sysupgrade*.bin' -exec cp -v {} output/ \; || true
-          find openwrt-src/bin/targets -name '*factory*.bin'  -exec cp -v {} output/ \; || true
           find openwrt-src/bin/targets -name '*factory*.ubi'  -exec cp -v {} output/ \; || true
+          find openwrt-src/bin/targets -name '*factory*.bin'  -exec cp -v {} output/ \; || true
           find openwrt-src/bin/targets -name '*initramfs*'    -exec cp -v {} output/ \; || true
-          find openwrt-src/bin/targets -name '*.itb'          -exec cp -v {} output/ \; || true
           find openwrt-src/bin -name 'myhelper*.ipk' -exec cp -v {} output/ \; || true
-          echo "=== output contents ==="
+          echo "=== output ==="
           ls -la output/
-          if [ -z "$(ls -A output)" ]; then
-            echo "ERROR: no images produced"
-            find openwrt-src/bin/targets -maxdepth 4 -type f | head -40
-            exit 1
-          fi
 
-      - name: Upload firmware artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: rd16-firmware
+          name: rd16-firmware-prebuild
           path: output/*
           if-no-files-found: error
           retention-days: 30
