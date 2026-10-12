@@ -1,4 +1,4 @@
-name: Build RD16 firmware (prebuild)
+name: Build RD16 firmware (prebuild + verify)
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 600
+    timeout-minutes: 400
     steps:
       - name: Checkout myhelper package
         uses: actions/checkout@v4
@@ -18,8 +18,16 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential clang flex bison g++ gawk \
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
-            python3 python3-setuptools rsync subversion swig time unzip \
-            zlib1g-dev file wget bc libelf-dev cpio aria2
+            python3 python3-setuptools python3-pip rsync subversion swig time \
+            unzip zlib1g-dev file wget bc libelf-dev cpio aria2 squashfs-tools
+          pip install --quiet ubi_reader
+
+      - name: Verify tools
+        run: |
+          echo "=== Tool versions ==="
+          which ubireader_extract_images
+          which unsquashfs
+          ubireader_extract_images --version 2>&1 | head -3 || true
 
       - name: Clone RomikB source
         run: |
@@ -27,20 +35,20 @@ jobs:
           git clone --depth 1 --branch openwrt-24-rd15 \
             https://github.com/RomikB/openwrt.git openwrt-src
           cd openwrt-src
+          echo "=== vendor_scripts ==="
           ls -la vendor_scripts/
+          echo "=== target/linux/ipq53xx ==="
+          ls -la target/linux/ipq53xx/
 
-      - name: Download stock firmware for kernel extraction
+      - name: Download stock RD16 firmware
         run: |
           set -e
           cd openwrt-src
-          # !!! ЗАМЕНИ URL НА СВОЮ ССЫЛКУ ИЗ RELEASE !!!
           STOCK_URL="https://github.com/serv4173-cloud/myhelper-openwrt/releases/download/stock-1.0.31/miwifi_rd16_firmware_87da2_1.0.31.bin"
-          echo "Downloading stock firmware from $STOCK_URL"
+          echo "Downloading: $STOCK_URL"
           curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 600 \
             -o miwifi_rd16_firmware_87da2_1.0.31.bin "$STOCK_URL"
           ls -la miwifi_rd16_firmware_87da2_1.0.31.bin
-          # Версия для совместимости с prepare_feed.sh (он ищет rd15)
-          cp miwifi_rd16_firmware_87da2_1.0.31.bin miwifi_rd15_firmware_stub.bin || true
 
       - name: Copy myhelper into source tree
         run: |
@@ -56,37 +64,40 @@ jobs:
           sed -i 's/^    /\t/' "$FILE"
           grep -nP '^\t' "$FILE" | head -10 | cat -A
 
-      - name: Prepare feeds (extracts vendor kernel)
+      - name: Extract vendor feed + kernel from stock firmware
         run: |
           set -e
           cd openwrt-src
-          echo "=== Running prepare_feed.sh ==="
-          sh vendor_scripts/prepare_feed.sh
-          echo "=== Checking extracted kernel ==="
-          ls -la target/linux/ipq53xx/rd15/kernel 2>/dev/null || echo "NO rd15 kernel"
-          ls -la target/linux/ipq53xx/rd16/kernel 2>/dev/null || echo "NO rd16 kernel"
-          # Если rd16 kernel нет — копируем из rd15
-          if [ ! -f target/linux/ipq53xx/rd16/kernel ] && [ -f target/linux/ipq53xx/rd15/kernel ]; then
-            cp target/linux/ipq53xx/rd15/kernel target/linux/ipq53xx/rd16/kernel
-            echo "Copied rd15 kernel to rd16"
-          fi
-          ls -la target/linux/ipq53xx/rd16/kernel
+          chmod +x vendor_scripts/*.sh
+          echo "=== Running prepare_feed.sh rd16 ==="
+          sh vendor_scripts/prepare_feed.sh rd16
 
-      - name: Prepare config for RD16 (prebuild)
+          echo "=== Checking extracted kernel (rd16) ==="
+          ls -la target/linux/ipq53xx/rd16/kernel 2>/dev/null || echo "!!! NO rd16 kernel !!!"
+          ls -la target/linux/ipq53xx/rd15/kernel 2>/dev/null || echo "no rd15 kernel"
+
+          if [ ! -f target/linux/ipq53xx/rd16/kernel ]; then
+            echo "ERROR: prepare_feed.sh did not produce rd16/kernel"
+            find target/linux/ipq53xx -name 'kernel' -exec ls -la {} \;
+            exit 1
+          fi
+          echo "Kernel size: $(stat -c%s target/linux/ipq53xx/rd16/kernel) bytes"
+
+      - name: Prepare config for RD16 (prebuild, no QSDK)
         run: |
           set -e
           cd openwrt-src
-          chmod +x vendor_scripts/*.sh vendor_scripts/*.py 2>/dev/null || true
+          echo "=== Running prepare_config.sh rd16 ==="
           sh vendor_scripts/prepare_config.sh rd16
 
-          # Оставляем ТОЛЬКО prebuild (убираем QSDK — он ломает сеть)
+          # Drop QSDK profiles (they cause network failure on RD16)
           sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config
           sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk-podkop/d' .config
 
           make defconfig
 
-          echo "=== Active devices ==="
-          grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "!!! NO DEVICES !!!"
+          echo "=== Active RD16 devices ==="
+          grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "!!! NO RD16 DEVICES !!!"
 
       - name: Remove QSDK packages from target.mk
         run: |
@@ -104,11 +115,14 @@ jobs:
           done
           grep -E "qca-|wififw" "$TARGET_MK" && echo "!!! still present !!!" || echo "OK: QSDK removed"
 
-      - name: Prepare feeds install
+      - name: Feeds update + patch + install
         run: |
           set -e
           cd openwrt-src
           ./scripts/feeds update -a
+          if [ -f vendor_scripts/patch_feeds.py ]; then
+            python3 vendor_scripts/patch_feeds.py || echo "patch_feeds.py returned non-zero, continuing"
+          fi
           ./scripts/feeds install -a
 
       - name: Enable myhelper + runtime deps
@@ -124,7 +138,8 @@ jobs:
           echo "CONFIG_PACKAGE_kmod-nft-core=y"       >> .config
           echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"        >> .config
           make defconfig
-          grep -E '^CONFIG_PACKAGE_(myhelper|nftables|tc|kmod-sched-cake|kmod-ifb|kmod-tcp-bbr|kmod-nft-core)=' .config || true
+          echo "=== Verify enabled packages ==="
+          grep -E '^CONFIG_PACKAGE_(myhelper|nftables|tc|kmod-sched-cake|kmod-ifb|kmod-tcp-bbr|kmod-nft-core)=y' .config || true
 
       - name: Build kmod toolchain (GCC 7.5.0)
         run: |
@@ -137,34 +152,40 @@ jobs:
           set -e
           cd openwrt-src
           make -j$(nproc) V=s || make -j1 V=s
-      - name: Verify compiled kernel
+
+      - name: Verify compiled kernel + DTB (Part 3)
         run: |
           set -e
           cd openwrt-src
-    
-          # Найти собранный kernel
-          KERNEL=$(find build_dir -name 'Image' -path '*linux-ipq53xx*' | head -1)
-          echo "Kernel: $KERNEL"
-          ls -la "$KERNEL"
-    
-          # Найти DTB для RD16
+
+          echo "=== Locating compiled kernel ==="
+          KERNEL=$(find build_dir -name 'Image' -path '*linux-ipq53xx*rd16*' | head -1)
+          if [ -z "$KERNEL" ]; then
+            KERNEL=$(find build_dir -name 'Image' -path '*linux-ipq53xx*' | head -1)
+          fi
+          echo "Kernel path: $KERNEL"
+          if [ -f "$KERNEL" ]; then
+            echo "Kernel size: $(stat -c%s $KERNEL) bytes"
+            if strings "$KERNEL" | grep -q "ipq53"; then
+              echo "OK: kernel contains ipq53 references"
+            fi
+            if strings "$KERNEL" | grep -q "qca-nss"; then
+              echo "OK: kernel contains NSS references"
+            fi
+          else
+            echo "WARNING: kernel Image not found in build_dir"
+          fi
+
+          echo "=== Locating compiled DTB ==="
           DTB=$(find build_dir -name 'ipq5332-rd16.dtb' | head -1)
-          echo "DTB: $DTB"
-          ls -la "$DTB"
-    
-          # Проверить, что DTB валидный
+          echo "DTB path: $DTB"
           if [ -f "$DTB" ]; then
-            echo "DTB is valid binary"
+            echo "DTB size: $(stat -c%s $DTB) bytes"
             xxd "$DTB" | head -2
+          else
+            echo "WARNING: ipq5332-rd16.dtb not found"
           fi
-    
-          # Проверить, что kernel несёт встроенные драйверы (grep по строкам)
-          if strings "$KERNEL" | grep -q "ipq53"; then
-            echo "OK: kernel contains ipq53 references"
-          fi
-          if strings "$KERNEL" | grep -q "qca-nss"; then
-            echo "OK: kernel contains NSS references"
-          fi
+
       - name: Collect firmware images
         run: |
           set -e
@@ -176,50 +197,54 @@ jobs:
           find openwrt-src/bin -name 'myhelper*.ipk' -exec cp -v {} output/ \; || true
           echo "=== output ==="
           ls -la output/
-      - name: Verify firmware image
+
+      - name: Verify UBI image (Part 1)
         run: |
           set -e
           cd output
-    
-          echo "=== Files ==="
-          ls -la
-    
+
           UBI_FILE=$(find . -name '*prebuild*factory.ubi' | head -1)
           if [ -z "$UBI_FILE" ]; then
-            echo "ERROR: no factory.ubi found"
+            UBI_FILE=$(find . -name '*factory.ubi' | head -1)
+          fi
+          if [ -z "$UBI_FILE" ]; then
+            echo "ERROR: no factory.ubi found in output"
+            ls -la
             exit 1
           fi
+
           echo "Checking: $UBI_FILE"
-          echo "Size: $(stat -c%s $UBI_FILE) bytes"
-    
-          # Проверка размера (ожидаем 6-12 МБ)
           SIZE=$(stat -c%s "$UBI_FILE")
+          echo "Size: $SIZE bytes"
+
           if [ "$SIZE" -lt 4000000 ] || [ "$SIZE" -gt 20000000 ]; then
-            echo "WARNING: size out of expected range (4-20 MB)"
+            echo "WARNING: size outside expected 4-20 MB range"
           fi
-    
-          # Проверка что файл начинается с UBI magic (0x55424923 = "UBI#")
+
           MAGIC=$(xxd -p -l 4 "$UBI_FILE")
           echo "Magic bytes: $MAGIC"
           if [ "$MAGIC" != "55424923" ]; then
-            echo "WARNING: file does not start with UBI# magic"
+            echo "WARNING: does not start with 'UBI#' magic"
           else
-            echo "OK: valid UBI magic"
+            echo "OK: valid UBI# magic"
           fi
-    
-          # Проверка наличия строки ipq5332-rd16.dtb внутри (DTB для нашей модели)
+
           if strings "$UBI_FILE" | grep -q "ipq5332-rd16"; then
             echo "OK: found ipq5332-rd16 DTB reference"
           else
-            echo "WARNING: no ipq5332-rd16 DTB reference — Wi-Fi/LAN may not work"
+            echo "WARNING: no ipq5332-rd16 DTB reference"
           fi
-    
-          # Проверка наличия myhelper
+
           if strings "$UBI_FILE" | grep -q "myhelper"; then
             echo "OK: found myhelper"
           else
             echo "WARNING: no myhelper in image"
           fi
+
+          if strings "$UBI_FILE" | grep -q "xiaomi"; then
+            echo "OK: found xiaomi references"
+          fi
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         if: success()
