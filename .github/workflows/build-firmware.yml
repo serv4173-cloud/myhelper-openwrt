@@ -190,6 +190,12 @@ jobs:
           echo "CONFIG_PACKAGE_kmod-ifb=y"            >> .config
           echo "CONFIG_PACKAGE_kmod-nft-core=y"       >> .config
           echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"        >> .config
+          echo "CONFIG_PACKAGE_kmod-net-sched=y"      >> .config
+          echo "CONFIG_PACKAGE_kmod-ifb=y"            >> .config
+          echo "CONFIG_PACKAGE_kmod-sched-hfsc=y"     >> .config
+          echo "CONFIG_PACKAGE_kmod-act-mirred=y"     >> .config
+          echo "CONFIG_PACKAGE_kmod-act-gact=y"       >> .config
+          echo "CONFIG_PACKAGE_kmod-sch-ingress=y"    >> .config
           make defconfig
           echo "=== Verify enabled packages ==="
           grep -E '^CONFIG_PACKAGE_(myhelper|nftables|tc|kmod-sched-cake|kmod-ifb|kmod-tcp-bbr|kmod-nft-core)=y' .config || true
