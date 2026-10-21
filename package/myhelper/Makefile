@@ -57,6 +57,9 @@ define Package/myhelper/install
     $(INSTALL_DIR) $(1)/www/luci-static/resources/view/myhelper
     $(INSTALL_DATA) ./files/www/luci-static/resources/view/myhelper/game_boost.js \
         $(1)/www/luci-static/resources/view/myhelper/game_boost.js
+    $(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) ./files/etc/uci-defaults/99-myhelper-boot-success \
+		$(1)/etc/uci-defaults/99-myhelper-boot-success
 endef
 
 $(eval $(call BuildPackage,myhelper))
