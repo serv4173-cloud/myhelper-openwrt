@@ -1,0 +1,7 @@
+#!/bin/sh
+# Tell U-Boot that OpenWrt booted successfully, so it doesn't roll back to stock
+nvram set flag_boot_success=1
+nvram set flag_try_sys1_failed=0
+nvram set flag_try_sys2_failed=0
+nvram commit
+exit 0
