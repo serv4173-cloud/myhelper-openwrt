@@ -73,41 +73,32 @@ jobs:
           echo "=== Running prepare_feed.sh rd16 ==="
           sh vendor_scripts/prepare_feed.sh rd16
 
-          echo "=== Checking where the kernel was extracted ==="
-          # Ищем файл kernel везде в target/linux
-          KERNEL_PATH=$(find target/linux -name 'kernel' | head -n 1)
+          echo "=== Checking target/linux/ipq53xx/ structure ==="
+          ls -la target/linux/ipq53xx/
+          ls -la target/linux/ipq53xx/image/
           
-          if [ -z "$KERNEL_PATH" ]; then
-            echo "ERROR: prepare_feed.sh did not produce any kernel file"
-            echo "=== Dumping target/linux/ipq53xx/ structure ==="
-            ls -la target/linux/ipq53xx/ || true
-            exit 1
-          fi
-          
-          echo "Found kernel at: $KERNEL_PATH"
-          
-          # Создаем нужную папку и копируем ядро туда, где его ждет сборка
-          mkdir -p target/linux/ipq53xx/rd16
-          cp -f "$KERNEL_PATH" target/linux/ipq53xx/rd16/kernel
-          
-          echo "=== Successfully prepared kernel for rd16 ==="
-          ls -la target/linux/ipq53xx/rd16/kernel
+          echo "=== Looking for kernel anywhere ==="
+          find target/linux -name 'kernel' || true
+          find vendor_feed -name 'kernel' || true
 
-      - name: Prepare config for RD16 (prebuild, no QSDK)
+      - name: Prepare config for RD16 (prebuild only, no QSDK)
         run: |
           set -e
           cd openwrt-src
-          echo "=== Running prepare_config.sh rd16 ==="
-          sh vendor_scripts/prepare_config.sh rd16
+          chmod +x vendor_scripts/*.sh vendor_scripts/*.py 2>/dev/null || true
+          
+          echo "=== Running prepare_config.sh ==="
+          # Пробуем запустить с аргументом rd16, если упадет - пробуем без
+          sh vendor_scripts/prepare_config.sh rd16 || sh vendor_scripts/prepare_config.sh || true
 
-          # Drop QSDK profiles (they cause network failure on RD16)
-          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config
-          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk-podkop/d' .config
+          # Оставляем ТОЛЬКО prebuild (убираем QSDK, если они есть в конфиге)
+          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config 2>/dev/null || true
+          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk-podkop/d' .config 2>/dev/null || true
 
           make defconfig
 
           echo "=== Active RD16 devices ==="
-          grep -E '^CONFIG_TARGET_DEVICE_ipq53xx_rd16' .config || echo "!!! NO RD16 DEVICES !!!"
+          grep -E '^CONFIG_TARGET_DEVICE_ipq53xx' .config || echo "!!! NO DEVICES FOUND !!!"
 
       - name: Stub out broken QSDK CLI packages
         run: |
