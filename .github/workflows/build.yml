@@ -24,7 +24,7 @@ jobs:
       - name: Clone RomikB source (branch openwrt-24-rd15)
         run: |
           set -e
-          git clone --depth 1 --branch openwrt-24-rd15 \
+          git clone --depth 1 --branch openwrt-24-be3600 \
             https://github.com/RomikB/openwrt.git openwrt-src
           cd openwrt-src
           echo "=== Top-level ==="
