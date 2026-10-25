@@ -204,6 +204,59 @@ return view.extend({
                         .catch(function () { self.status = {}; }),
             self.fetchDevices()
         ]);
+    }, 
+
+
+
+    // --- NEW: Live Speed calculation ---
+    lastBytes: null, // Переменная для хранения предыдущих значений трафика
+
+    updateLiveSpeed: function () {
+        var self = this;
+        var iface = uci.get('myhelper', 'settings', 'wan_iface') || 'wan';
+
+        // Динамически объявляем RPC-вызов для текущего WAN-интерфейса
+        var callIfaceStatus = rpc.declare({
+            object: 'network.interface.' + iface,
+            method: 'status'
+        });
+
+        return callIfaceStatus().then(function (res) {
+            if (!res || !res.statistics) return;
+
+            var now = Date.now();
+            var rx = res.statistics.rx_bytes;
+            var tx = res.statistics.tx_bytes;
+
+            // При первом запуске просто запоминаем значения
+            if (!self.lastBytes) {
+                self.lastBytes = { rx: rx, tx: tx, time: now };
+                return;
+            }
+
+            var dt = (now - self.lastBytes.time) / 1000; // разница в секундах
+            if (dt > 0) {
+                var rxDiff = rx - self.lastBytes.rx;
+                var txDiff = tx - self.lastBytes.tx;
+
+                // Защита от отрицательных значений (если интерфейс перезагрузился)
+                if (rxDiff < 0) rxDiff = 0;
+                if (txDiff < 0) txDiff = 0;
+
+                // Перевод байт в Мбит/с: (байты * 8) / 1 000 000
+                var rxMbps = ((rxDiff * 8) / 1000000 / dt).toFixed(2);
+                var txMbps = ((txDiff * 8) / 1000000 / dt).toFixed(2);
+
+                // Обновляем значение в таблице
+                if (self.$fields && self.$fields.liveSpeed) {
+                    self.$fields.liveSpeed.firstChild.nodeValue = 
+                        '↓ ' + rxMbps + ' Mb/s / ↑ ' + txMbps + ' Mb/s';
+                }
+            }
+            self.lastBytes = { rx: rx, tx: tx, time: now };
+        }).catch(function (err) {
+            console.error("Live speed error:", err);
+        });
     },
 
     /* ---------------------------------------------------------------
@@ -213,18 +266,34 @@ return view.extend({
     renderStatusPanel: function () {
         var self = this;
         var s = this.status || {};
+        var preset = uci.get('myhelper', 'settings', 'qos_preset') || 'disabled';
+        var bwUp   = uci.get('myhelper', 'settings', 'bandwidth_upload') || '0';
+        var bwDown = uci.get('myhelper', 'settings', 'bandwidth_download') || '0';
+        var enabled = uci.get('myhelper', 'settings', 'enabled') === '1';
+
+        // Calculate latest latency from history
+        var lastRtt = '---';
+        if (s.history && s.history.length > 0) {
+            var last = s.history[s.history.length - 1];
+            if (last.ok) {
+                lastRtt = (last.rtt_us / 1000).toFixed(0) + ' ms';
+            } else {
+                lastRtt = 'timeout';
+            }
+        }
 
         this.$fields = {
             internet: s.internet
                 ? E('span', { 'class': 'label success' }, _('ONLINE'))
                 : E('span', { 'class': 'label warning' }, _('OFFLINE')),
-            fail:         E('span', {}, '%d / %d'.format(s.fail_count || 0, s.threshold || 0)),
-            uptime:       E('span', {}, fmtUptime(s.uptime)),
-            recoveries:   E('span', {}, String(s.recovery_count || 0)),
-            lastRecovery: E('span', {}, fmtTimestamp(s.last_recovery)),
-            gamingIp:     E('span', {}, s.gaming_ip || _('not resolved'))
+            preset:   E('span', { 'class': 'label' }, enabled ? preset : _('disabled')),
+            latency:  E('span', { 'class': 'label', 'style': 'background:#5cb85c; color:white' }, lastRtt),
+            limits:   E('span', {}, '↓ ' + bwDown + ' / ↑ ' + bwUp),
+            liveSpeed: E('span', { 'style': 'font-family: monospace; font-size: 14px;' }, '↓ 0.00 Mb/s / ↑ 0.00 Mb/s'),
+            recoveries: E('span', {}, String(s.recovery_count || 0))
         };
 
+        // Buttons
         var btnForce = E('button', {
             'class': 'cbi-button cbi-button-action',
             'click': ui.createHandlerFn(this, function () {
@@ -234,7 +303,7 @@ return view.extend({
                     return self.pollStatus().then(function () { self.refreshPanel(); });
                 });
             })
-        }, _('Force Recovery Now'));
+        }, _('Force Recovery'));
 
         var btnQos = E('button', {
             'class': 'cbi-button cbi-button-apply',
@@ -247,29 +316,28 @@ return view.extend({
 
         var table = E('table', { 'class': 'table' }, [
             E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left', 'width': '30%' }, _('Internet')),
+                E('td', { 'class': 'td left', 'width': '20%' }, _('Internet')),
                 E('td', { 'class': 'td left' }, this.$fields.internet)
             ]),
             E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left' }, _('Gaming device IP')),
-                E('td', { 'class': 'td left', 'style': 'font-family: monospace' },
-                  this.$fields.gamingIp)
+                E('td', { 'class': 'td left' }, _('CAKE Preset')),
+                E('td', { 'class': 'td left' }, this.$fields.preset)
             ]),
             E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left' }, _('Failed probes')),
-                E('td', { 'class': 'td left' }, this.$fields.fail)
+                E('td', { 'class': 'td left' }, _('Current Ping')),
+                E('td', { 'class': 'td left' }, this.$fields.latency)
             ]),
             E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left' }, _('Uptime')),
-                E('td', { 'class': 'td left' }, this.$fields.uptime)
+                E('td', { 'class': 'td left' }, _('Configured Limit')),
+                E('td', { 'class': 'td left' }, this.$fields.limits)
             ]),
             E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left' }, _('Recovery count')),
+                E('td', { 'class': 'td left' }, _('Live Speed')),
+                E('td', { 'class': 'td left' }, this.$fields.liveSpeed)
+            ]),
+            E('tr', { 'class': 'tr' }, [
+                E('td', { 'class': 'td left' }, _('Recoveries')),
                 E('td', { 'class': 'td left' }, this.$fields.recoveries)
-            ]),
-            E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left' }, _('Last recovery')),
-                E('td', { 'class': 'td left' }, this.$fields.lastRecovery)
             ]),
             E('tr', { 'class': 'tr' }, [
                 E('td', { 'class': 'td left' }, _('Actions')),
@@ -810,7 +878,7 @@ o.default = '0';
                 self.refreshDevicesTable();
                 self.refreshGraphs();
             });
-        }, 5000);
+        }, 3000);
     },
 
     handleSaveApply: function (ev, mode) {
