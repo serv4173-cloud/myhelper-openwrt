@@ -79,45 +79,51 @@ resolve_wan_dev() {
 
 resolve_mac_to_ip() {
     local target_mac="$1"
-    local target_ip="$2"   # "ipv4" or "ipv6"
-    local json dev idx mac ip key
-
+    local target_ip="$2"
     target_mac=$(echo "$target_mac" | tr 'A-Z' 'a-z')
 
-    if [ "$target_ip" = "ipv6" ]; then
-        json=$(ubus call dhcp ipv6leases 2>/dev/null) || return 1
-        key="ip6"
-    else
-        json=$(ubus call dhcp ipv4leases 2>/dev/null) || return 1
-        key="ip"
+    # Method 1: dnsmasq leases (RomikB build uses dnsmasq, not odhcpd)
+    if [ -f /tmp/dhcp.leases ]; then
+        local ip
+        if [ "$target_ip" = "ipv6" ]; then
+            ip=$(awk -v mac="$target_mac" \
+                  'tolower($2) == mac { print $4; exit }' \
+                  /tmp/dhcp.leases)
+        else
+            ip=$(awk -v mac="$target_mac" \
+                  'tolower($2) == mac { print $3; exit }' \
+                  /tmp/dhcp.leases)
+        fi
+        if [ -n "$ip" ] && [ "$ip" != "*" ]; then
+            echo "$ip"
+            return 0
+        fi
     fi
 
+    # Method 2: odhcpd via ubus (fallback)
+    local json dev idx m key
+    if [ "$target_ip" = "ipv6" ]; then
+        json=$(ubus call dhcp ipv6leases 2>/dev/null)
+        key="ip6"
+    else
+        json=$(ubus call dhcp ipv4leases 2>/dev/null)
+        key="ip"
+    fi
     [ -n "$json" ] || return 1
 
     for dev in br-lan br-guest br-iot; do
         idx=0
         while :; do
-            mac=$(echo "$json" | jsonfilter \
-                  -e "@.device['$dev'].leases[$idx].mac" 2>/dev/null)
-            [ -z "$mac" ] && break
-            if [ "$(echo "$mac" | tr 'A-Z' 'a-z')" = "$target_mac" ]; then
+            m=$(echo "$json" | jsonfilter \
+                -e "@.device['$dev'].leases[$idx].mac" 2>/dev/null)
+            [ -z "$m" ] && break
+            if [ "$(echo "$m" | tr 'A-Z' 'a-z')" = "$target_mac" ]; then
                 echo "$json" | jsonfilter \
                     -e "@.device['$dev'].leases[$idx].${key}" 2>/dev/null
                 return 0
             fi
             idx=$((idx + 1))
         done
-    done
-
-    idx=0
-    while :; do
-        mac=$(echo "$json" | jsonfilter -e "@.leases[$idx].mac" 2>/dev/null)
-        [ -z "$mac" ] && break
-        if [ "$(echo "$mac" | tr 'A-Z' 'a-z')" = "$target_mac" ]; then
-            echo "$json" | jsonfilter -e "@.leases[$idx].${key}" 2>/dev/null
-            return 0
-        fi
-        idx=$((idx + 1))
     done
 
     return 1
@@ -145,7 +151,7 @@ cleanup_qos() {
 # ---------------------------------------------------------------------------
 apply_bbr() {
     config_load myhelper
-    config_get bbr_enabled game_boost bbr_enabled 0
+    config_get bbr_enabled settings bbr_enabled 0
 
     if [ "$bbr_enabled" = "1" ]; then
         modprobe tcp_bbr 2>/dev/null
@@ -173,7 +179,7 @@ cake_preset_flags() {
             echo "besteffort triple-isolate nat wash"
             ;;
         custom)
-            config_get custom_flags game_boost custom_cake_flags ""
+            config_get custom_flags settings custom_cake_flags ""
             echo "$custom_flags"
             ;;
         *)
@@ -189,7 +195,6 @@ cake_linklayer_suffix() {
     local ll="$1" oh="$2"
     local s=""
     [ -n "$oh" ] && [ "$oh" != "0" ] && s="overhead $oh"
-    [ -n "$ll" ] && [ "$ll" != "none" ] && s="$s linklayer $ll"
     echo "$s"
 }
 
@@ -253,16 +258,16 @@ apply_hfsc_game_boost() {
 # ---------------------------------------------------------------------------
 apply_qos() {
     config_load myhelper
-    config_get enabled    game_boost enabled             0
-    config_get ports      game_boost ports               ""
-    config_get wan_if     game_boost wan_iface           "wan"
-    config_get bw_up      game_boost bandwidth_upload    "0"
-    config_get bw_down    game_boost bandwidth_download  "0"
-    config_get qos_preset game_boost qos_preset          "balanced"
-    config_get game_bw    game_boost game_bandwidth_guarantee "8000"
-    config_get pfifo_lim  game_boost game_pfifo_limit    "10"
-    config_get linklayer  game_boost linklayer           "ethernet"
-    config_get overhead   game_boost overhead            "34"
+    config_get enabled    settings enabled             0
+    config_get ports      settings ports               ""
+    config_get wan_if     settings wan_iface           "wan"
+    config_get bw_up      settings bandwidth_upload    "0"
+    config_get bw_down    settings bandwidth_download  "0"
+    config_get qos_preset settings qos_preset          "balanced"
+    config_get game_bw    settings game_bandwidth_guarantee "8000"
+    config_get pfifo_lim  settings game_pfifo_limit    "10"
+    config_get linklayer  settings linklayer           "ethernet"
+    config_get overhead   settings overhead            "34"
 
     if [ "$enabled" != "1" ]; then
       logger -t myhelper-watchdog "game_boost disabled, cleaning up"
@@ -341,7 +346,7 @@ apply_qos() {
             logger -t myhelper-watchdog "MAC $mac -> IPv6 $ip6"
         fi
     }
-    config_list_foreach game_boost target_mac handle_target_mac
+    config_list_foreach settings target_mac handle_target_mac
 
     if [ -n "$GAMING_IP_CAPTURED" ]; then
         echo "$GAMING_IP_CAPTURED" > "$GAMING_IP_FILE"
@@ -351,7 +356,7 @@ apply_qos() {
 
     # Port-based marking (v4 + v6)
     if [ -n "$ports" ]; then
-        portset=$(echo "$ports" | tr ',' ' ')
+        portset=$(echo "$ports" | sed "s/ *, */, /g")
         nft add rule inet "$NFT_TABLE" mark_out \
             tcp dport "{ $portset }" ip dscp set cs6 \
             comment '"myhelper: game tcp ports v4"'
