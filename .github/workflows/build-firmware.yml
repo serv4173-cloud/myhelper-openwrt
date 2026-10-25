@@ -150,24 +150,30 @@ jobs:
             head -5 "$PKG_DIR/Makefile"
           done
 
+
       - name: Remove QSDK packages from target.mk
         run: |
           set -e
           cd openwrt-src
-          TARGET_MK="target/linux/ipq53xx/rd16/target.mk"
 
-          # Remove ONLY failing packages — KEEP Wi-Fi drivers (kmod-qca-wifi-*,
-          # qca-wifi-scripts, wififw_mount_script, kmod-qca-nss-*).
-          for pkg in \
-            qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor \
-            qca-hostap-vendor qca-cfg80211tool-vendor qca-cnss-daemon-vendor \
-            qca-firmware-vendor qca-ssdk-shell kmod-qca-nss-ecm-wifi-plugin \
-            yt-9215s-client ; do
-            sed -i "s|${pkg}||g" "$TARGET_MK"
-          done
+          # RomikB changed the repo structure, so target.mk might be in a different place.
+          TARGET_MK=$(find target/linux/ipq53xx/ -name 'target.mk' | head -n 1)
 
-          echo "=== After removal ==="
-          grep -E "qca-|wififw|kmod-qca" "$TARGET_MK" || echo "no QSDK CLI references left"
+          if [ -z "$TARGET_MK" ]; then
+            echo "!!! WARNING: target.mk not found. Skipping this step. !!!"
+          else
+            echo "Found target.mk at: $TARGET_MK"
+            # Remove ONLY failing packages — KEEP Wi-Fi drivers.
+            for pkg in \
+              qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor \
+              qca-hostap-vendor qca-cfg80211tool-vendor qca-cnss-daemon-vendor \
+              qca-firmware-vendor qca-ssdk-shell kmod-qca-nss-ecm-wifi-plugin \
+              yt-9215s-client ; do
+              sed -i "s|${pkg}||g" "$TARGET_MK"
+            done
+            echo "=== After removal ==="
+            grep -E "qca-|wififw|kmod-qca" "$TARGET_MK" || echo "no QSDK CLI references left"
+          fi
 
       - name: Feeds update + patch + install
         run: |
