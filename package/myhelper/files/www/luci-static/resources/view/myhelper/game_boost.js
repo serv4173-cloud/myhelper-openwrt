@@ -526,14 +526,9 @@ return view.extend({
             _('Internet watchdog and gaming traffic prioritization for the Xiaomi Router BE3600.')
         );
 
-        m.tab('watchdog',   _('Internet Watchdog'));
-        m.tab('game_boost', _('Game Boost (QoS)'));
-        m.tab('devices',    _('Devices'));
-        m.tab('monitor',    _('Monitor'));
 
         /* ---- Tab 1: Watchdog ---- */
         var s = m.section(form.NamedSection, 'watchdog', 'myhelper', _('Watchdog'));
-        s.tab = 'watchdog'; s.anonymous = true; s.addremove = false;
 
         var o = s.option(form.Flag, 'enabled', _('Enable Watchdog'));
         o.rmempty = false; o.default = '1';
@@ -553,16 +548,15 @@ return view.extend({
         o.depends('enabled', '1');
 
         o = s.option(form.Value, 'probe_host_1', _('Primary Probe Host'));
-        o.datatype = 'hostname'; o.placeholder = '1.1.1.1'; o.default = '1.1.1.1';
+        o.datatype = 'hostname4'; o.placeholder = '1.1.1.1'; o.default = '1.1.1.1';
         o.depends('enabled', '1');
 
         o = s.option(form.Value, 'probe_host_2', _('Secondary Probe Host'));
-        o.datatype = 'hostname'; o.placeholder = '8.8.8.8'; o.default = '8.8.8.8';
+        o.datatype = 'hostname4'; o.placeholder = '8.8.8.8'; o.default = '8.8.8.8';
         o.depends('enabled', '1');
 
         /* ---- Tab 2: Game Boost ---- */
-        s = m.section(form.NamedSection, 'game_boost', 'settings', _('Game Boost'));
-        s.tab = 'game_boost'; s.anonymous = true; s.addremove = false;
+        s = m.section(form.NamedSection, 'settings', 'game_boost', _('Game Boost'));
 
         o = s.option(form.Flag, 'enabled', _('Enable Game Boost'));
         o.rmempty = false; o.default = '0';
@@ -678,8 +672,7 @@ o.rmempty = false;
 o.default = '0';
 
         /* ---- Tab 3: Devices ---- */
-        s = m.section(form.NamedSection, 'game_boost', 'settings', _('Devices'));
-        s.tab = 'devices'; s.anonymous = true; s.addremove = false;
+        s = m.section(form.NamedSection, 'settings', '_devices_sec', _('Devices'));
 
             o = s.option(form.DummyValue, '_devices');
     o.rawhtml  = false;
@@ -694,9 +687,8 @@ o.default = '0';
         expect: { result: false }
     });
 
-    s = m.section(form.NamedSection, 'game_boost', 'settings',
+    s = m.section(form.NamedSection, 'settings', '_bw_sec',
                   _('Bandwidth Measurement'));
-    s.tab = 'game_boost'; s.anonymous = true; s.addremove = false;
 
     o = s.option(form.DummyValue, '_speedtest');
     o.rawhtml  = false;
@@ -738,7 +730,7 @@ o.default = '0';
     };
 
     return m;
-    }
+    },
 
     /* ---------------------------------------------------------------
      * Render
@@ -746,47 +738,46 @@ o.default = '0';
 
     render: function () {
         var self = this;
-
         this.formMap = this.buildForm();
-        var root = this.formMap.render();
+        return this.formMap.render().then(function (root) {
+            root.insertBefore(self.renderStatusPanel(), root.firstChild);
 
-        root.insertBefore(this.renderStatusPanel(), root.firstChild);
+            setTimeout(function () {
+                var panel = root.querySelector('.cbi-tab-descr[id$="monitor"],' +
+                                              ' .cbi-tab[id$="monitor"]');
+                var host  = panel || root;
+                var container = E('div', { id: 'myhelper-graphs' });
 
-        setTimeout(function () {
-            var panel = root.querySelector('.cbi-tab-descr[id$="monitor"],' +
-                                          ' .cbi-tab[id$="monitor"]');
-            var host  = panel || root;
-            var container = E('div', { id: 'myhelper-graphs' });
+                container.style.display = 'flex';
+                container.style.gap = '16px';
+                container.style.flexWrap = 'wrap';
 
-            container.style.display = 'flex';
-            container.style.gap = '16px';
-            container.style.flexWrap = 'wrap';
+                var s = self.status || {};
+                var gInternet = E('div', { style: 'flex: 1 1 45%; min-width: 320px;' });
+                var gDevice   = E('div', { style: 'flex: 1 1 45%; min-width: 320px;' });
 
-            var s = self.status || {};
-            var gInternet = E('div', { style: 'flex: 1 1 45%; min-width: 320px;' });
-            var gDevice   = E('div', { style: 'flex: 1 1 45%; min-width: 320px;' });
+                gInternet.appendChild(renderSvgGraph(s.history || [], {
+                    title:    _('Latency to Internet'),
+                    subtitle: _('Targets: 1.1.1.1 / 8.8.8.8')
+                }));
+                gDevice.appendChild(renderSvgGraph(s.history_device || [], {
+                    title:     _('Latency to Gaming Device'),
+                    subtitle:  s.gaming_ip
+                        ? _('Target: %s').format(s.gaming_ip)
+                        : _('No gaming device resolved'),
+                    emptyText: _('No gaming device configured or no active lease.')
+                }));
 
-            gInternet.appendChild(renderSvgGraph(s.history || [], {
-                title:    _('Latency to Internet'),
-                subtitle: _('Targets: 1.1.1.1 / 8.8.8.8')
-            }));
-            gDevice.appendChild(renderSvgGraph(s.history_device || [], {
-                title:     _('Latency to Gaming Device'),
-                subtitle:  s.gaming_ip
-                    ? _('Target: %s').format(s.gaming_ip)
-                    : _('No gaming device resolved'),
-                emptyText: _('No gaming device configured or no active lease.')
-            }));
+                container.appendChild(gInternet);
+                container.appendChild(gDevice);
+                host.appendChild(container);
 
-            container.appendChild(gInternet);
-            container.appendChild(gDevice);
-            host.appendChild(container);
+                self.$graphs = { root: container, internet: gInternet, device: gDevice };
+            }, 100);
 
-            self.$graphs = { root: container, internet: gInternet, device: gDevice };
-        }, 100);
-
-        this.startPolling();
-        return root;
+            self.startPolling();
+            return root;
+        });
     },
 
     refreshGraphs: function () {
