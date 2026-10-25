@@ -69,19 +69,29 @@ jobs:
           set -e
           cd openwrt-src
           chmod +x vendor_scripts/*.sh
+          
           echo "=== Running prepare_feed.sh rd16 ==="
           sh vendor_scripts/prepare_feed.sh rd16
 
-          echo "=== Checking extracted kernel (rd16) ==="
-          ls -la target/linux/ipq53xx/rd16/kernel 2>/dev/null || echo "!!! NO rd16 kernel !!!"
-          ls -la target/linux/ipq53xx/rd15/kernel 2>/dev/null || echo "no rd15 kernel"
-
-          if [ ! -f target/linux/ipq53xx/rd16/kernel ]; then
-            echo "ERROR: prepare_feed.sh did not produce rd16/kernel"
-            find target/linux/ipq53xx -name 'kernel' -exec ls -la {} \;
+          echo "=== Checking where the kernel was extracted ==="
+          # Ищем файл kernel везде в target/linux
+          KERNEL_PATH=$(find target/linux -name 'kernel' | head -n 1)
+          
+          if [ -z "$KERNEL_PATH" ]; then
+            echo "ERROR: prepare_feed.sh did not produce any kernel file"
+            echo "=== Dumping target/linux/ipq53xx/ structure ==="
+            ls -la target/linux/ipq53xx/ || true
             exit 1
           fi
-          echo "Kernel size: $(stat -c%s target/linux/ipq53xx/rd16/kernel) bytes"
+          
+          echo "Found kernel at: $KERNEL_PATH"
+          
+          # Создаем нужную папку и копируем ядро туда, где его ждет сборка
+          mkdir -p target/linux/ipq53xx/rd16
+          cp -f "$KERNEL_PATH" target/linux/ipq53xx/rd16/kernel
+          
+          echo "=== Successfully prepared kernel for rd16 ==="
+          ls -la target/linux/ipq53xx/rd16/kernel
 
       - name: Prepare config for RD16 (prebuild, no QSDK)
         run: |
