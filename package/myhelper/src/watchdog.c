@@ -8,13 +8,14 @@
  *
  * RTT is measured inside the child with clock_gettime() around the
  * sendto/recvfrom pair and delivered to the parent through a pipe.
- * This avoids fork/exec/scheduler jitter in the reported rtt_us.
- * The round's rtt_us is the minimum among successful children, so a
- * single host timing out does not inflate the reported WAN ping.
  *
  * WAN recovery is fully async via uloop_process + uloop_timeout; the
- * daemon never blocks on sleep(), so "status" ubus calls keep working
- * during recovery.
+ * daemon never blocks on sleep(). On SIGTERM, any in-flight recovery
+ * child is killed, so a fast procd restart cannot leave two parallel
+ * "ubus call ... up" running against the same interface.
+ *
+ * Speedtest is an async ubus method: fork+exec `apply_qos speedtest`,
+ * the daemon tracks running/last result in status. Never blocks uloop.
  */
 
 #include <stdio.h>
@@ -55,6 +56,20 @@
 #define HISTORY_VERSION       1
 #define GAMING_IP_FILE        "/tmp/myhelper_gaming_ip"
 
+#define EVENT_RING_SIZE       20
+#define EVENT_DETAIL_LEN      64
+
+/* Event types (also seen by JS, keep stable). */
+#define EV_PROBE_OK           1
+#define EV_PROBE_FAIL         2
+#define EV_RECOVERY_START     3
+#define EV_RECOVERY_DONE      4
+#define EV_QOS_OK             5
+#define EV_QOS_FAIL           6
+#define EV_SPEEDTEST_START    7
+#define EV_SPEEDTEST_OK       8
+#define EV_SPEEDTEST_FAIL     9
+
 /* ---------------- Logging ---------------- */
 #ifdef MYHELPER_DEBUG_STDOUT
 static void debug_log(int priority, const char *fmt, ...)
@@ -63,10 +78,8 @@ static void debug_log(int priority, const char *fmt, ...)
     time_t t = time(NULL);
     struct tm tm_info;
     localtime_r(&t, &tm_info);
-
     char time_str[26];
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_info);
-
     va_list ap;
     va_start(ap, fmt);
     printf("[%s] ", time_str);
@@ -91,6 +104,7 @@ static int      g_fail_count       = 0;
 static uint32_t g_recovery_count   = 0;
 static uint32_t g_last_recovery_ts = 0;
 static uint32_t g_start_time       = 0;
+static int      g_prev_internet_ok = -1;   /* -1 unknown, else 0/1 */
 
 /* ---------------- Ring buffer ---------------- */
 struct ping_sample {
@@ -106,22 +120,26 @@ static struct ping_sample g_history_device[HISTORY_SIZE];
 static int g_history_device_idx   = 0;
 static int g_history_device_count = 0;
 
-/* Shared flush counter: increments on BOTH internet and device samples.
- * Flushes history file every HISTORY_FLUSH_EVERY combined samples.
- * When device probe is disabled (empty gaming_ip), behaves exactly as
- * before: flush every 10 internet samples. */
 static int g_samples_since_flush  = 0;
+
+/* ---------------- Event ring ---------------- */
+struct event {
+    uint32_t ts;
+    uint8_t  type;
+    char     detail[EVENT_DETAIL_LEN];
+};
+
+static struct event g_events[EVENT_RING_SIZE];
+static int g_events_idx = 0;
+static int g_events_cnt = 0;
 
 /* ---------------- Probe targets ---------------- */
 static const char *g_probe_hosts[MAX_PROBES] = { "1.1.1.1", "8.8.8.8", NULL };
+static int         g_expected_probes = 0;
 
 static char g_gaming_ip[INET_ADDRSTRLEN] = "";
 
-/* ---------------- Probe orchestration state ----------------
- * Result of a ping child is delivered through a pipe so we get precise
- * RTT measured inside the child (around sendto/recvfrom), not fork+exec
- * overhead. see ping_host() and spawn_probe().
- */
+/* ---------------- Probe orchestration ---------------- */
 struct probe_result {
     uint8_t  ok;
     uint32_t rtt_us;
@@ -130,18 +148,22 @@ struct probe_result {
 struct probe_child {
     struct uloop_process proc;
     int                  is_device;
-    int                  read_fd;   /* read end of pipe from child */
+    int                  read_fd;
 };
 
 static int      g_net_pending   = 0;
 static int      g_net_alive     = 0;
-static uint32_t g_net_rtt_us    = 0;   /* min of successful children this round */
+static uint32_t g_net_rtt_us    = 0;
+static int      g_round_ok      = 0;
+static int      g_round_total   = 0;
+static int      g_last_round_ok    = 0;   /* last COMPLETED round */
+static int      g_last_round_total = 0;
 
 static int      g_dev_pending   = 0;
 static int      g_dev_alive     = 0;
-static uint32_t g_dev_rtt_us    = 0;   /* min of successful children this round */
+static uint32_t g_dev_rtt_us    = 0;
 
-/* ---------------- Async WAN recovery state ---------------- */
+/* ---------------- Async WAN recovery ---------------- */
 #define RECOVERY_IDLE   0
 #define RECOVERY_DOWN   1
 #define RECOVERY_DELAY  2
@@ -149,11 +171,19 @@ static uint32_t g_dev_rtt_us    = 0;   /* min of successful children this round 
 #define RECOVERY_IFUP   4
 
 static int                   g_recovery_state   = RECOVERY_IDLE;
-static struct uloop_process  g_recovery_proc;      /* reused across steps */
+static struct uloop_process  g_recovery_proc;
 static struct uloop_timeout  g_recovery_delay_timer;
 static int                   g_recovery_rc_down = -1;
 static int                   g_recovery_rc_up   = -1;
 static int                   g_recovery_rc_ifup = -1;
+
+/* ---------------- Async speedtest ---------------- */
+static int         g_speedtest_running      = 0;
+static uint32_t    g_speedtest_start_ts     = 0;
+static uint32_t    g_speedtest_last_ts      = 0;
+static int         g_speedtest_last_rc      = -1;
+static char        g_speedtest_last_msg[EVENT_DETAIL_LEN] = "";
+static struct uloop_process g_speedtest_proc;
 
 /* ---------------- uloop / ubus ---------------- */
 static struct uloop_timeout  g_check_timer;
@@ -187,6 +217,19 @@ static void rstrip_newline(char *s)
         s[--len] = '\0';
 }
 
+static void event_push(uint8_t type, const char *fmt, ...)
+{
+    struct event *e = &g_events[g_events_idx];
+    e->ts   = (uint32_t)time(NULL);
+    e->type = type;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(e->detail, sizeof(e->detail), fmt, ap);
+    va_end(ap);
+    g_events_idx = (g_events_idx + 1) % EVENT_RING_SIZE;
+    if (g_events_cnt < EVENT_RING_SIZE) g_events_cnt++;
+}
+
 static void refresh_gaming_ip(void)
 {
     FILE *f = fopen(GAMING_IP_FILE, "r");
@@ -218,9 +261,12 @@ static void refresh_gaming_ip(void)
 /* ============================================================
  *  Signal handling
  * ============================================================ */
+static volatile sig_atomic_t g_shutdown = 0;
+
 static void on_signal(int sig)
 {
     (void)sig;
+    g_shutdown = 1;
     uloop_end();
 }
 
@@ -262,42 +308,36 @@ static void history_load_into(const char *key,
         blob_buf_free(&b); free(json); return;
     }
 
-    /* Note: blobmsg_lookup() was removed from recent libubox.
- * Use blobmsg_parse() with a policy to extract the array. */
-static const struct blobmsg_policy top_policy[] = {
-    { .name = "samples",        .type = BLOBMSG_TYPE_ARRAY },
-    { .name = "samples_device", .type = BLOBMSG_TYPE_ARRAY },
-};
-struct blob_attr *top[ARRAY_SIZE(top_policy)];
-blobmsg_parse(top_policy, ARRAY_SIZE(top_policy), top,
-              blob_data(b.head), blob_len(b.head));
+    static const struct blobmsg_policy top_policy[] = {
+        { .name = "samples",        .type = BLOBMSG_TYPE_ARRAY },
+        { .name = "samples_device", .type = BLOBMSG_TYPE_ARRAY },
+    };
+    struct blob_attr *top[ARRAY_SIZE(top_policy)];
+    blobmsg_parse(top_policy, ARRAY_SIZE(top_policy), top,
+                  blob_data(b.head), blob_len(b.head));
 
-struct blob_attr *arr = NULL;
-if (strcmp(key, "samples") == 0)
-    arr = top[0];
-else if (strcmp(key, "samples_device") == 0)
-    arr = top[1];
+    struct blob_attr *arr = NULL;
+    if (strcmp(key, "samples") == 0)
+        arr = top[0];
+    else if (strcmp(key, "samples_device") == 0)
+        arr = top[1];
 
-if (!arr || blobmsg_type(arr) != BLOBMSG_TYPE_ARRAY) {
-    blob_buf_free(&b); free(json); return;
-}
+    if (!arr || blobmsg_type(arr) != BLOBMSG_TYPE_ARRAY) {
+        blob_buf_free(&b); free(json); return;
+    }
     struct blob_attr *cur;
     int rem = blobmsg_len(arr);
     blobmsg_for_each_attr(cur, arr, rem) {
         if (blobmsg_type(cur) != BLOBMSG_TYPE_TABLE) continue;
-
         struct blob_attr *tb[ARRAY_SIZE(sample_policy)];
         blobmsg_parse(sample_policy, ARRAY_SIZE(sample_policy), tb,
                       blobmsg_data(cur), blobmsg_len(cur));
         if (!tb[0] || !tb[1]) continue;
-
         struct ping_sample *slot = &buf[*idx_out];
         slot->ok     = blobmsg_get_u8 (tb[0]);
         slot->rtt_us = blobmsg_get_u32(tb[1]);
-
         *idx_out = (*idx_out + 1) % (int)buf_sz;
-        if (*cnt_out < (int)buf_sz)
-            (*cnt_out)++;
+        if (*cnt_out < (int)buf_sz) (*cnt_out)++;
         (*samples_out)++;
     }
 
@@ -396,11 +436,6 @@ static unsigned short icmp_checksum(const void *buf, int len)
     return (unsigned short)~sum;
 }
 
-/* Send one ICMP echo and wait for a reply.
- * Returns 1 on success, 0 on failure.
- * On success, *rtt_us_out receives the measured round-trip in microseconds,
- * timed between sendto() and recvfrom() — i.e. excluding socket setup,
- * getaddrinfo, fork/exec and everything else. */
 static int ping_host(const char *host, int timeout_sec, uint32_t *rtt_us_out)
 {
     if (rtt_us_out) *rtt_us_out = 0;
@@ -449,8 +484,6 @@ static int ping_host(const char *host, int timeout_sec, uint32_t *rtt_us_out)
 /* ============================================================
  *  Process helpers
  * ============================================================ */
-/* Non-blocking fork+exec. Returns pid (>0) on success, -1 on failure.
- * The child's exit status is delivered via uloop_process_add() .cb. */
 static pid_t spawn_command(const char *path, char *const argv[])
 {
     pid_t pid = fork();
@@ -466,16 +499,15 @@ static pid_t spawn_command(const char *path, char *const argv[])
 
 /* ============================================================
  *  Async WAN recovery
- *
- *   IDLE --recover_wan()--> DOWN (fork ubus down)
- *   DOWN --child exit--> DELAY (2s uloop_timeout)
- *   DELAY --timeout--> UP (fork ubus up)
- *   UP --child exit ok--> IDLE
- *   UP --child exit err--> IFUP (fork ifup)
- *   IFUP --child exit--> IDLE
  * ============================================================ */
 static void recovery_reset(void)
 {
+    if (g_recovery_state != RECOVERY_IDLE) {
+        int ok = (g_recovery_rc_down == 0 && g_recovery_rc_up == 0) ? 1 : 0;
+        event_push(EV_RECOVERY_DONE, "%s (down=%d up=%d ifup=%d)",
+                   ok ? "success" : "completed with errors",
+                   g_recovery_rc_down, g_recovery_rc_up, g_recovery_rc_ifup);
+    }
     g_recovery_state   = RECOVERY_IDLE;
     g_recovery_rc_down = -1;
     g_recovery_rc_up   = -1;
@@ -487,7 +519,6 @@ static void recovery_ifup_cb(struct uloop_process *p, int ret)
     (void)p;
     g_recovery_rc_ifup = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) ? 0 : -1;
     MY_LOG(LOG_WARNING, "ifup %s fallback rc=%d", cfg_wan, g_recovery_rc_ifup);
-    MY_LOG(LOG_INFO, "WAN recovery completed (ifup fallback)");
     recovery_reset();
 }
 
@@ -518,7 +549,6 @@ static void recovery_up_cb(struct uloop_process *p, int ret)
     if (g_recovery_rc_down != 0 || g_recovery_rc_up != 0) {
         recovery_start_ifup();
     } else {
-        MY_LOG(LOG_INFO, "WAN recovery completed (ubus down+up)");
         recovery_reset();
     }
 }
@@ -557,12 +587,10 @@ static void recovery_down_cb(struct uloop_process *p, int ret)
     g_recovery_rc_down = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) ? 0 : -1;
     MY_LOG(LOG_INFO, "ubus down rc=%d", g_recovery_rc_down);
 
-    /* 2-second pause between down and up, but via uloop — NOT sleep(). */
     g_recovery_state = RECOVERY_DELAY;
     uloop_timeout_set(&g_recovery_delay_timer, RECOVERY_DOWN_UP_DELAY_MS);
 }
 
-/* Returns 0 if recovery was started, -1 if one is already in progress. */
 static int recover_wan(void)
 {
     if (g_recovery_state != RECOVERY_IDLE) {
@@ -572,6 +600,7 @@ static int recover_wan(void)
     }
 
     MY_LOG(LOG_WARNING, "Attempting WAN recovery (interface=%s)", cfg_wan);
+    event_push(EV_RECOVERY_START, "WAN recovery started (iface=%s)", cfg_wan);
 
     char iface_path[64];
     snprintf(iface_path, sizeof(iface_path), "network.interface.%s", cfg_wan);
@@ -595,13 +624,14 @@ static int recover_wan(void)
 }
 
 /* ============================================================
- *  QoS reapply (synchronous — short; result reported to ubus)
+ *  QoS reapply (synchronous — short)
  * ============================================================ */
 static int reapply_game_qos(void)
 {
     pid_t pid = fork();
     if (pid < 0) {
         MY_LOG(LOG_ERR, "reapply_game_qos fork failed: %s", strerror(errno));
+        event_push(EV_QOS_FAIL, "fork failed: %s", strerror(errno));
         return -1;
     }
     if (pid == 0) {
@@ -615,18 +645,48 @@ static int reapply_game_qos(void)
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) {
         MY_LOG(LOG_ERR, "waitpid failed: %s", strerror(errno));
+        event_push(EV_QOS_FAIL, "waitpid failed");
         return -1;
     }
     refresh_gaming_ip();
 
     if (!WIFEXITED(status)) {
-        MY_LOG(LOG_WARNING, "apply_qos terminated abnormally (status=0x%x)", status);
+        MY_LOG(LOG_WARNING, "apply_qos terminated abnormally (0x%x)", status);
+        event_push(EV_QOS_FAIL, "apply_qos killed (status=0x%x)", status);
         return -1;
     }
     int rc = WEXITSTATUS(status);
-    if (rc != 0)
+    if (rc == 0) {
+        event_push(EV_QOS_OK, "apply_qos rc=0");
+    } else {
         MY_LOG(LOG_WARNING, "apply_qos exited rc=%d", rc);
+        event_push(EV_QOS_FAIL, "apply_qos rc=%d", rc);
+    }
     return rc;
+}
+
+/* ============================================================
+ *  Async speedtest
+ * ============================================================ */
+static void speedtest_child_cb(struct uloop_process *p, int ret)
+{
+    (void)p;
+    int rc = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) ? 0 : -1;
+
+    g_speedtest_running  = 0;
+    g_speedtest_last_ts  = (uint32_t)time(NULL);
+    g_speedtest_last_rc  = rc;
+
+    if (rc == 0) {
+        snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg), "OK");
+        event_push(EV_SPEEDTEST_OK, "speedtest completed");
+        MY_LOG(LOG_INFO, "speedtest completed successfully");
+    } else {
+        snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg),
+                 "failed (rc=%d)", rc);
+        event_push(EV_SPEEDTEST_FAIL, "speedtest failed (rc=%d)", rc);
+        MY_LOG(LOG_WARNING, "speedtest failed (rc=%d)", rc);
+    }
 }
 
 /* ============================================================
@@ -637,23 +697,18 @@ static void probe_child_cb(struct uloop_process *p, int ret)
     (void)ret;
     struct probe_child *pc = container_of(p, struct probe_child, proc);
 
-    /* Child exited; its write end is closed, so read() returns either
-     * the full struct or 0 (EOF, child died without writing). Neither
-     * blocks because parent's write end was closed right after fork(). */
     struct probe_result res = { 0, 0 };
     if (pc->read_fd >= 0) {
         ssize_t n = read(pc->read_fd, &res, sizeof(res));
         close(pc->read_fd);
         pc->read_fd = -1;
         if (n != (ssize_t)sizeof(res)) {
-            /* child died before writing (SIGKILL, OOM, bug) — treat as fail */
-            res.ok     = 0;
-            res.rtt_us = 0;
+            res.ok = 0; res.rtt_us = 0;
         }
     }
 
-    int ok         = res.ok ? 1 : 0;
-    uint32_t rtt   = res.rtt_us;
+    int ok       = res.ok ? 1 : 0;
+    uint32_t rtt = res.rtt_us;
 
     if (pc->is_device) {
         if (ok) {
@@ -667,12 +722,18 @@ static void probe_child_cb(struct uloop_process *p, int ret)
     } else {
         if (ok) {
             g_net_alive = 1;
+            g_round_ok++;
             if (g_net_rtt_us == 0 || rtt < g_net_rtt_us)
                 g_net_rtt_us = rtt;
         }
+        g_round_total++;
         g_net_pending--;
-        if (g_net_pending == 0)
+        if (g_net_pending == 0) {
+            g_last_round_ok    = g_round_ok;
+            g_last_round_total = (g_round_total > 0) ? g_round_total
+                                                    : g_expected_probes;
             handle_probe_result(g_net_alive, g_net_rtt_us);
+        }
     }
     free(pc);
 }
@@ -695,22 +756,17 @@ static void spawn_probe(const char *host, int is_device)
     pc->proc.pid  = fork();
 
     if (pc->proc.pid == 0) {
-        /* child */
-        close(pipefd[0]);                    /* child only writes */
+        close(pipefd[0]);
         freopen("/dev/null", "w", stdout);
         freopen("/dev/null", "w", stderr);
 
         struct probe_result res = { 0, 0 };
         res.ok = ping_host(host, PING_TIMEOUT_SEC, &res.rtt_us) ? 1 : 0;
-
-        /* small struct (< PIPE_BUF) → atomic write; ignore partial */
         (void)write(pipefd[1], &res, sizeof(res));
-        /* _exit closes pipefd[1] automatically */
         _exit(res.ok ? 0 : 1);
     }
 
-    /* parent */
-    close(pipefd[1]);                        /* parent only reads; must close write end */
+    close(pipefd[1]);
 
     if (pc->proc.pid < 0) {
         MY_LOG(LOG_ERR, "spawn_probe: fork() failed: %s", strerror(errno));
@@ -730,6 +786,8 @@ static void start_probe(void)
     g_net_pending = 0;
     g_net_alive   = 0;
     g_net_rtt_us  = 0;
+    g_round_ok    = 0;
+    g_round_total = 0;
 
     for (int i = 0; g_probe_hosts[i] != NULL && i < MAX_PROBES; i++)
         spawn_probe(g_probe_hosts[i], 0);
@@ -760,14 +818,21 @@ static void start_device_probe(void)
 static void handle_probe_result(int alive, uint32_t rtt_us)
 {
     if (alive) {
-        if (g_fail_count > 0)
+        if (g_fail_count > 0) {
             MY_LOG(LOG_INFO, "Connectivity restored after %d failure(s)",
                    g_fail_count);
+            event_push(EV_PROBE_OK, "connectivity restored after %d fail(s)",
+                       g_fail_count);
+        }
         g_fail_count  = 0;
         g_internet_ok = 1;
         history_push(1, rtt_us);
     } else {
         g_fail_count++;
+        if (g_prev_internet_ok != 0) {
+            event_push(EV_PROBE_FAIL, "connectivity lost (fail %d/%d)",
+                       g_fail_count, cfg_threshold);
+        }
         g_internet_ok = 0;
         MY_LOG(LOG_WARNING, "Internet probe failed (%d/%d)",
                g_fail_count, cfg_threshold);
@@ -784,6 +849,7 @@ static void handle_probe_result(int alive, uint32_t rtt_us)
             g_fail_count = 0;
         }
     }
+    g_prev_internet_ok = g_internet_ok;
     uloop_timeout_set(&g_check_timer, cfg_interval * 1000);
 }
 
@@ -810,8 +876,6 @@ static void qos_timer_cb(struct uloop_timeout *t)
     int rc = reapply_game_qos();
     if (rc != 0)
         MY_LOG(LOG_WARNING, "Post-recovery QoS reapply failed (rc=%d)", rc);
-    else
-        MY_LOG(LOG_INFO, "Post-recovery QoS reapply OK");
 }
 
 /* ============================================================
@@ -826,6 +890,21 @@ static void bbuf_add_history(struct blob_buf *b, const char *key,
         void *e = blobmsg_open_table(b, NULL);
         blobmsg_add_u8 (b, "ok",     buf[k].ok);
         blobmsg_add_u32(b, "rtt_us", buf[k].rtt_us);
+        blobmsg_close_table(b, e);
+    }
+    blobmsg_close_array(b, arr);
+}
+
+static void bbuf_add_events(struct blob_buf *b)
+{
+    void *arr = blobmsg_open_array(b, "events");
+    for (int i = 0; i < g_events_cnt; i++) {
+        int k = (g_events_idx - g_events_cnt + i + EVENT_RING_SIZE)
+                % EVENT_RING_SIZE;
+        void *e = blobmsg_open_table(b, NULL);
+        blobmsg_add_u32 (&b, "ts",     g_events[k].ts);
+        blobmsg_add_u32 (&b, "type",   g_events[k].type);
+        blobmsg_add_string(&b, "detail", g_events[k].detail);
         blobmsg_close_table(b, e);
     }
     blobmsg_close_array(b, arr);
@@ -848,10 +927,22 @@ static int ubus_status_cb(struct ubus_context *ctx, struct ubus_object *obj,
     blobmsg_add_u32(&g_bbuf, "recovery_state", (uint32_t)g_recovery_state);
     blobmsg_add_string(&g_bbuf, "gaming_ip",   g_gaming_ip);
 
+    blobmsg_add_u32(&g_bbuf, "probes_ok",      (uint32_t)g_last_round_ok);
+    blobmsg_add_u32(&g_bbuf, "probes_total",   (uint32_t)g_last_round_total);
+
+    blobmsg_add_u8 (&g_bbuf, "speedtest_running",   g_speedtest_running);
+    blobmsg_add_u32(&g_bbuf, "speedtest_start_ts",  g_speedtest_start_ts);
+    blobmsg_add_u32(&g_bbuf, "speedtest_last_ts",   g_speedtest_last_ts);
+    blobmsg_add_u8 (&g_bbuf, "speedtest_last_ok",
+                    (g_speedtest_last_ts > 0 && g_speedtest_last_rc == 0) ? 1 : 0);
+    blobmsg_add_string(&g_bbuf, "speedtest_last_msg", g_speedtest_last_msg);
+
     bbuf_add_history(&g_bbuf, "history",
                      g_history, g_history_idx, g_history_count);
     bbuf_add_history(&g_bbuf, "history_device",
                      g_history_device, g_history_device_idx, g_history_device_count);
+
+    bbuf_add_events(&g_bbuf);
 
     ubus_send_reply(ctx, req, g_bbuf.head);
     return 0;
@@ -895,10 +986,61 @@ static int ubus_qos_reapply_cb(struct ubus_context *ctx, struct ubus_object *obj
     return 0;
 }
 
+static int ubus_speedtest_cb(struct ubus_context *ctx, struct ubus_object *obj,
+                             struct ubus_request_data *req, const char *method,
+                             struct blob_attr *msg)
+{
+    (void)obj; (void)method; (void)msg;
+
+    if (g_speedtest_running) {
+        blob_buf_init(&g_bbuf, 0);
+        blobmsg_add_u8 (&g_bbuf, "ok", 0);
+        blobmsg_add_u8 (&g_bbuf, "busy", 1);
+        blobmsg_add_u32(&g_bbuf, "started_at", g_speedtest_start_ts);
+        ubus_send_reply(ctx, req, g_bbuf.head);
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        blob_buf_init(&g_bbuf, 0);
+        blobmsg_add_u8 (&g_bbuf, "ok", 0);
+        blobmsg_add_string(&g_bbuf, "error", "fork failed");
+        ubus_send_reply(ctx, req, g_bbuf.head);
+        return 0;
+    }
+    if (pid == 0) {
+        freopen("/dev/null", "w", stdout);
+        freopen("/dev/null", "w", stderr);
+        execl("/etc/init.d/myhelper-watchdog",
+              "myhelper-watchdog", "speedtest", (char *)NULL);
+        _exit(127);
+    }
+
+    g_speedtest_running  = 1;
+    g_speedtest_start_ts = (uint32_t)time(NULL);
+
+    memset(&g_speedtest_proc, 0, sizeof(g_speedtest_proc));
+    g_speedtest_proc.cb  = speedtest_child_cb;
+    g_speedtest_proc.pid = pid;
+    uloop_process_add(&g_speedtest_proc);
+
+    event_push(EV_SPEEDTEST_START, "speedtest started (pid=%d)", pid);
+    MY_LOG(LOG_INFO, "speedtest started (pid=%d)", pid);
+
+    blob_buf_init(&g_bbuf, 0);
+    blobmsg_add_u8 (&g_bbuf, "ok", 1);
+    blobmsg_add_u8 (&g_bbuf, "busy", 0);
+    blobmsg_add_u32(&g_bbuf, "started_at", g_speedtest_start_ts);
+    ubus_send_reply(ctx, req, g_bbuf.head);
+    return 0;
+}
+
 static const struct ubus_method myhelper_methods[] = {
     UBUS_METHOD_NOARG("status",         ubus_status_cb),
     UBUS_METHOD_NOARG("force_recovery", ubus_force_recovery_cb),
     UBUS_METHOD_NOARG("qos_reapply",    ubus_qos_reapply_cb),
+    UBUS_METHOD_NOARG("speedtest",      ubus_speedtest_cb),
 };
 
 static struct ubus_object_type myhelper_obj_type =
@@ -957,6 +1099,9 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
 
     g_start_time = (uint32_t)time(NULL);
+    for (int i = 0; g_probe_hosts[i] != NULL && i < MAX_PROBES; i++)
+        g_expected_probes++;
+
     uloop_init();
     history_load();
     recovery_reset();
@@ -979,12 +1124,34 @@ int main(int argc, char **argv)
     uloop_timeout_set(&g_check_timer, 1000);
     uloop_run();
 
+    MY_LOG(LOG_INFO, "uloop exited (shutdown=%d)", (int)g_shutdown);
+
+    /* Shutdown: kill any in-flight recovery child so a fast procd
+     * restart cannot leave two parallel "ubus call ... up". */
+    if (g_recovery_state != RECOVERY_IDLE && g_recovery_proc.pid > 0) {
+        MY_LOG(LOG_INFO, "Shutdown: terminating recovery child "
+               "(pid=%d, state=%d)", g_recovery_proc.pid, g_recovery_state);
+        kill(g_recovery_proc.pid, SIGTERM);
+        int st;
+        pid_t r = waitpid(g_recovery_proc.pid, &st, WNOHANG);
+        if (r == 0)
+            waitpid(g_recovery_proc.pid, &st, 0);
+        g_recovery_proc.pid = 0;
+        g_recovery_state    = RECOVERY_IDLE;
+    }
+    uloop_timeout_cancel(&g_recovery_delay_timer);
+
+    if (g_speedtest_running) {
+        MY_LOG(LOG_INFO, "Shutdown: speedtest still running (pid=%d), "
+               "leaving orphan (UCI will still be written)", 
+               g_speedtest_proc.pid);
+    }
+
     history_save();
     MY_LOG(LOG_INFO, "History flushed on shutdown");
 
     uloop_timeout_cancel(&g_check_timer);
     uloop_timeout_cancel(&g_qos_timer);
-    uloop_timeout_cancel(&g_recovery_delay_timer);
     if (g_ubus_ctx) {
         ubus_remove_object(g_ubus_ctx, &myhelper_obj);
         ubus_free(g_ubus_ctx);
