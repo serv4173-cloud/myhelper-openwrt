@@ -9,9 +9,10 @@
 var callStatus        = rpc.declare({ object: 'myhelper', method: 'status' });
 var callForceRecovery = rpc.declare({ object: 'myhelper', method: 'force_recovery' });
 var callQosReapply    = rpc.declare({ object: 'myhelper', method: 'qos_reapply' });
+var callSpeedtest     = rpc.declare({ object: 'myhelper', method: 'speedtest' });
 
-var POLL_STATS  = 1;   // WAN rx/tx counters
-var POLL_STATUS = 5;   // myhelper status (history arrays — heavy)
+var POLL_STATS  = 1;
+var POLL_STATUS = 5;
 
 var loadChartScript = function() {
     return new Promise(function(resolve, reject) {
@@ -59,7 +60,36 @@ var fmtAgo = function(ts) {
     return Math.floor(sec / 86400) + 'd ago';
 };
 
+var fmtClock = function(ts) {
+    ts = Number(ts) || 0;
+    if (ts <= 0) return '—';
+    var d = new Date(ts * 1000);
+    var hh = ('0' + d.getHours()).slice(-2);
+    var mm = ('0' + d.getMinutes()).slice(-2);
+    var ss = ('0' + d.getSeconds()).slice(-2);
+    return hh + ':' + mm + ':' + ss;
+};
+
 var RECOVERY_STATE_LABEL = ['idle', 'down', 'delay', 'up', 'ifup'];
+
+var EVENT_TYPE_LABEL = {
+    1: { txt: 'PROBE OK',   cls: 'ev-ok' },
+    2: { txt: 'PROBE FAIL', cls: 'ev-fail' },
+    3: { txt: 'RECOVERY',   cls: 'ev-warn' },
+    4: { txt: 'RECOVERED',  cls: 'ev-ok' },
+    5: { txt: 'QOS OK',     cls: 'ev-ok' },
+    6: { txt: 'QOS FAIL',   cls: 'ev-fail' },
+    7: { txt: 'SPEEDTEST',  cls: 'ev-info' },
+    8: { txt: 'SPEED OK',   cls: 'ev-ok' },
+    9: { txt: 'SPEED FAIL', cls: 'ev-fail' }
+};
+
+var getGbEnabled = function() {
+    var v = uci.get('myhelper', 'settings', 'game_boost_enabled');
+    if (v === null || v === undefined)
+        v = uci.get('myhelper', 'settings', 'enabled');
+    return v === '1';
+};
 
 var readSpeedtest = function() {
     return {
@@ -81,11 +111,14 @@ var fmtSpeedtest = function(st) {
 
 return view.extend({
     speedChart: null,
+    chartMode: 'speed',
     lastBytes: null,
     status: null,
     wanIface: 'wan',
     callIfaceStatus: null,
     _pollingStarted: false,
+    _prevSpeedtestRunning: 0,
+    _lastSpeedtestTs: 0,
 
     load: function() {
         var self = this;
@@ -98,6 +131,10 @@ return view.extend({
                 object: 'network.interface.' + self.wanIface,
                 method: 'status'
             });
+            if (self.status) {
+                self._prevSpeedtestRunning = Number(self.status.speedtest_running) || 0;
+                self._lastSpeedtestTs      = Number(self.status.speedtest_last_ts) || 0;
+            }
         });
     },
 
@@ -105,19 +142,22 @@ return view.extend({
         var self = this;
         var s = this.status || {};
 
-        var gbEnabled = uci.get('myhelper', 'settings', 'enabled') === '1';
+        var gbEnabled = getGbEnabled();
+        var preset    = uci.get('myhelper', 'settings', 'qos_preset')         || 'balanced';
+        var bwDown    = uci.get('myhelper', 'settings', 'bandwidth_download') || '0';
+        var bwUp      = uci.get('myhelper', 'settings', 'bandwidth_upload')   || '0';
+        var autoStr   = fmtSpeedtest(readSpeedtest());
 
-        var preset   = uci.get('myhelper', 'settings', 'qos_preset')         || 'balanced';
-        var bwDown   = uci.get('myhelper', 'settings', 'bandwidth_download') || '0';
-        var bwUp     = uci.get('myhelper', 'settings', 'bandwidth_upload')   || '0';
-        var autoStr  = fmtSpeedtest(readSpeedtest());
-
-        var wanPing  = parseLastPing(s, 'history');
-        var devPing  = (typeof s.gaming_ip === 'string' && s.gaming_ip.length)
-                       ? parseLastPing(s, 'history_device') : null;
-        var gamingIp = (typeof s.gaming_ip === 'string' && s.gaming_ip.length) ? s.gaming_ip : null;
+        var wanPing   = parseLastPing(s, 'history');
+        var devPing   = (typeof s.gaming_ip === 'string' && s.gaming_ip.length)
+                        ? parseLastPing(s, 'history_device') : null;
+        var gamingIp  = (typeof s.gaming_ip === 'string' && s.gaming_ip.length) ? s.gaming_ip : null;
 
         var internetOn = Number(s.internet) === 1;
+        var probesOk   = Number(s.probes_ok)    || 0;
+        var probesTot  = Number(s.probes_total) || 0;
+        var degraded   = internetOn && probesTot > 0 && probesOk < probesTot;
+
         var failCnt    = Number(s.fail_count)     || 0;
         var threshold  = Number(s.threshold)      || 0;
         var interval   = Number(s.interval)       || 0;
@@ -125,6 +165,7 @@ return view.extend({
         var recCnt     = Number(s.recovery_count) || 0;
         var lastRec    = Number(s.last_recovery)  || 0;
         var recState   = Number(s.recovery_state) || 0;
+        var stRunning  = Number(s.speedtest_running) || 0;
 
         var css = E('style', {}, `
             .myhelper-dashboard {
@@ -152,7 +193,9 @@ return view.extend({
                 background: var(--bg-panel); backdrop-filter: blur(16px);
                 border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px;
                 padding: 15px; box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+                margin-bottom: 15px;
             }
+            .myhelper-dashboard .panel:last-child { margin-bottom: 0; }
             .myhelper-dashboard .panel-header {
                 display: flex; align-items: center; gap: 8px; margin-bottom: 15px;
                 font-size: 14px; font-weight: bold; color: var(--accent-gold); text-transform: uppercase;
@@ -163,14 +206,33 @@ return view.extend({
             }
             .myhelper-dashboard .label-internet { color: #00ffcc; font-weight: bold; }
             .myhelper-dashboard .label-ping { color: var(--accent-gold); font-weight: bold; }
-            .myhelper-dashboard .badge-online { background: rgba(34, 197, 94, 0.15); color: var(--accent-green); padding: 2px 6px; border-radius: 4px; font-size: 10px; }
-            .myhelper-dashboard .badge-offline { background: rgba(255, 51, 51, 0.15); color: var(--accent-red); padding: 2px 6px; border-radius: 4px; font-size: 10px; }
-            .myhelper-dashboard .chart-container { height: 100px; width: 100%; background: rgba(0,0,0,0.5); border-radius: 4px; margin-top: 10px; }
+            .myhelper-dashboard .badge-online   { background: rgba(34, 197, 94, 0.15);  color: var(--accent-green); padding: 2px 6px; border-radius: 4px; font-size: 10px; }
+            .myhelper-dashboard .badge-degraded { background: rgba(245, 196, 81, 0.15); color: var(--accent-gold);  padding: 2px 6px; border-radius: 4px; font-size: 10px; }
+            .myhelper-dashboard .badge-offline  { background: rgba(255, 51, 51, 0.15);  color: var(--accent-red);   padding: 2px 6px; border-radius: 4px; font-size: 10px; }
+            .myhelper-dashboard .chart-header {
+                display: flex; justify-content: space-between; align-items: center;
+                font-size: 10px; color: var(--text-muted); text-transform: uppercase;
+                letter-spacing: 0.5px; margin-bottom: 4px;
+            }
+            .myhelper-dashboard .chart-modes { display: flex; gap: 4px; }
+            .myhelper-dashboard .chart-mode-btn {
+                padding: 2px 6px; font-size: 9px; border-radius: 3px;
+                background: transparent; border: 1px solid rgba(255,255,255,0.15);
+                color: var(--text-muted); cursor: pointer; text-transform: uppercase;
+            }
+            .myhelper-dashboard .chart-mode-btn.active {
+                background: rgba(0,210,255,0.15); border-color: var(--accent-blue);
+                color: var(--accent-blue);
+            }
+            .myhelper-dashboard .chart-container { height: 100px; width: 100%; background: rgba(0,0,0,0.5); border-radius: 4px; }
             .myhelper-dashboard .btn {
                 padding: 8px 12px; border-radius: 4px; border: none; font-weight: bold; cursor: pointer; font-size: 11px; text-transform: uppercase;
             }
             .myhelper-dashboard .btn-primary { background: var(--accent-red); color: #fff; box-shadow: 0 0 10px rgba(255, 51, 51, 0.4); }
             .myhelper-dashboard .btn-outline { background: transparent; border: 1px solid var(--accent-blue); color: var(--accent-blue); }
+            .myhelper-dashboard .btn-outline:disabled,
+            .myhelper-dashboard .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; }
+            .myhelper-dashboard .btn-auto { background: transparent; border: 1px solid var(--accent-gold); color: var(--accent-gold); }
             .myhelper-dashboard .toggle-switch {
                 position: relative; width: 36px; height: 18px; background: rgba(255,255,255,0.15); border-radius: 18px; cursor: pointer; transition: 0.3s;
             }
@@ -191,17 +253,66 @@ return view.extend({
                 font-size: 10px; color: var(--accent-gold); font-weight: bold;
                 margin-top: 6px; text-transform: uppercase; letter-spacing: 0.5px;
             }
+            .myhelper-dashboard .speedtest-line {
+                font-size: 10px; color: var(--accent-blue); margin-top: 6px;
+            }
+            .myhelper-dashboard details.events-block {
+                font-size: 10px; color: var(--text-muted);
+                border-top: 1px solid rgba(255,255,255,0.08);
+                padding-top: 8px; margin-top: 8px;
+            }
+            .myhelper-dashboard details.events-block summary {
+                cursor: pointer; text-transform: uppercase; letter-spacing: 0.5px;
+                color: var(--text-muted); font-size: 10px; outline: none;
+            }
+            .myhelper-dashboard .events-list {
+                max-height: 160px; overflow-y: auto;
+                font-family: monospace; font-size: 10px;
+                margin-top: 6px; line-height: 1.4;
+            }
+            .myhelper-dashboard .events-list .ev-row {
+                display: grid; grid-template-columns: 60px 80px 1fr; gap: 6px;
+            }
+            .myhelper-dashboard .ev-ok    { color: var(--accent-green); }
+            .myhelper-dashboard .ev-fail  { color: var(--accent-red); }
+            .myhelper-dashboard .ev-warn  { color: var(--accent-gold); }
+            .myhelper-dashboard .ev-info  { color: var(--accent-blue); }
         `);
+
+        var eventsList = (function() {
+            var events = Array.isArray(s.events) ? s.events : [];
+            if (events.length === 0) {
+                return [E('div', { 'style': 'padding: 6px 0;' }, '— no events yet —')];
+            }
+            var rows = [];
+            for (var i = events.length - 1; i >= 0; i--) {
+                var ev = events[i];
+                var meta = EVENT_TYPE_LABEL[Number(ev.type)] || { txt: '?', cls: '' };
+                rows.push(E('div', { 'class': 'ev-row' }, [
+                    E('span', { 'style': 'color: var(--text-muted);' }, fmtClock(ev.ts)),
+                    E('span', { 'class': meta.cls }, meta.txt),
+                    E('span', {}, ev.detail || '')
+                ]));
+            }
+            return rows;
+        })();
+
+        var internetBadgeTxt = internetOn
+            ? ((probesTot > 0) ? 'ONLINE ' + probesOk + '/' + probesTot : 'ONLINE')
+            : ((probesTot > 0) ? 'OFFLINE ' + probesOk + '/' + probesTot : 'OFFLINE');
+        var internetBadgeCls = internetOn
+            ? (degraded ? 'badge-degraded' : 'badge-online')
+            : 'badge-offline';
 
         var dashboard = E('div', { 'class': 'myhelper-dashboard' }, [
             E('div', { 'class': 'dashboard-grid' }, [
+                // LEFT COLUMN
                 E('div', {}, [
                     E('div', { 'class': 'panel' }, [
                         E('div', { 'class': 'panel-header' }, 'LIVE STATUS'),
                         E('div', { 'class': 'status-row' }, [
                             E('span', { 'class': 'label-internet' }, 'INTERNET'),
-                            E('span', { 'class': internetOn ? 'badge-online' : 'badge-offline', 'id': 'dash-badge' },
-                                       internetOn ? 'ONLINE' : 'OFFLINE')
+                            E('span', { 'class': internetBadgeCls, 'id': 'dash-badge' }, internetBadgeTxt)
                         ]),
                         E('div', { 'class': 'status-row' }, [
                             E('span', { 'class': 'label-ping' }, 'WAN PING'),
@@ -223,17 +334,38 @@ return view.extend({
                                 E('span', { 'id': 'dash-up',   'style': 'color: #ff3333; font-weight:bold;' }, '↑ 0.00 Mb/s')
                             ])
                         ]),
+                        E('div', { 'class': 'chart-header' }, [
+                            E('span', {}, 'TRAFFIC'),
+                            E('div', { 'class': 'chart-modes' }, [
+                                E('button', { 'class': 'chart-mode-btn active', 'data-mode': 'speed',
+                                    'click': ui.createHandlerFn(this, function(ev) {
+                                        self.switchChartMode('speed', ev.target);
+                                    })
+                                }, 'Speed'),
+                                E('button', { 'class': 'chart-mode-btn', 'data-mode': 'ping_wan',
+                                    'click': ui.createHandlerFn(this, function(ev) {
+                                        self.switchChartMode('ping_wan', ev.target);
+                                    })
+                                }, 'WAN'),
+                                E('button', { 'class': 'chart-mode-btn', 'data-mode': 'ping_dev',
+                                    'click': ui.createHandlerFn(this, function(ev) {
+                                        self.switchChartMode('ping_dev', ev.target);
+                                    })
+                                }, 'Device')
+                            ])
+                        ]),
                         E('div', { 'class': 'chart-container', 'id': 'dash-chart-container' }, [
                             E('canvas', { 'id': 'speedChart' })
                         ])
                     ])
                 ]),
+                // RIGHT COLUMN
                 E('div', {}, [
                     E('div', { 'class': 'panel' }, [
                         E('div', { 'class': 'panel-header' }, 'GAME BOOST'),
                         E('div', { 'style': 'font-size: 11px; color: #94a3b8; margin-bottom: 4px;' },
                           'Preset: ' + preset.toUpperCase() + ' | Limits: ↓' + bwDown + ' ↑' + bwUp),
-                        autoStr ? E('div', { 'class': 'auto-line' }, autoStr) : null,
+                        E('div', { 'class': 'auto-line', 'id': 'dash-auto' }, autoStr || ''),
                         E('div', { 'style': 'display:flex; align-items:center; gap:10px; margin: 15px 0;' }, [
                             E('div', {
                                 'class': 'toggle-switch ' + (gbEnabled ? 'active' : ''),
@@ -242,14 +374,14 @@ return view.extend({
                                     var el = ev.target;
                                     var willEnable = !el.classList.contains('active');
                                     el.classList.toggle('active');
-                                    uci.set('myhelper', 'settings', 'enabled', willEnable ? '1' : '0');
+                                    uci.set('myhelper', 'settings', 'game_boost_enabled', willEnable ? '1' : '0');
                                     ui.addNotification(null,
                                         E('p', _('Game Boost change pending. Click Save & Apply.')), 'info');
                                 })
                             }),
                             E('span', { 'style': 'font-size: 11px; font-weight: bold;' }, 'ENABLE GAME BOOST')
                         ]),
-                        E('div', { 'style': 'display: flex; gap: 10px;' }, [
+                        E('div', { 'style': 'display: flex; gap: 10px; flex-wrap: wrap;' }, [
                             E('button', {
                                 'class': 'btn btn-primary',
                                 'click': ui.createHandlerFn(this, function() {
@@ -258,15 +390,14 @@ return view.extend({
                                         .then(function(r) {
                                             if (!r || Number(r.ok) !== 1) {
                                                 throw new Error('qos_reapply failed (ok=' +
-                                                                (r && r.ok) + ', rc=' + (r && r.rc) + ')');
+                                                    (r && r.ok) + ', rc=' + (r && r.rc) + ')');
                                             }
                                             return callStatus();
                                         })
                                         .then(function(res) {
                                             self.status = res || {};
                                             var tEl = document.getElementById('dash-toggle');
-                                            if (tEl) tEl.classList.toggle('active',
-                                                uci.get('myhelper', 'settings', 'enabled') === '1');
+                                            if (tEl) tEl.classList.toggle('active', getGbEnabled());
                                             self.refreshStatusFields();
                                             ui.addNotification(null,
                                                 E('p', _('Configuration saved and applied.')), 'info');
@@ -310,8 +441,43 @@ return view.extend({
                                             });
                                     }
                                 })
-                            }, 'FORCE RECOVERY')
+                            }, 'FORCE RECOVERY'),
+                            E('button', {
+                                'class': 'btn btn-auto',
+                                'id': 'dash-speedtest-btn',
+                                'disabled': stRunning ? '' : null,
+                                'click': ui.createHandlerFn(this, function() {
+                                    callSpeedtest()
+                                        .then(function(r) {
+                                            if (!r || Number(r.ok) !== 1) {
+                                                if (r && Number(r.busy) === 1)
+                                                    throw new Error(_('Speedtest already running'));
+                                                throw new Error('speedtest not acknowledged');
+                                            }
+                                            ui.addNotification(null,
+                                                E('p', _('Speedtest started. May take up to 2 min.')), 'info');
+                                            return callStatus();
+                                        })
+                                        .then(function(res) {
+                                            if (res) {
+                                                self.status = res;
+                                                self.refreshStatusFields();
+                                            }
+                                        })
+                                        .catch(function(err) {
+                                            ui.addNotification(null,
+                                                E('p', _('Speedtest error: ') +
+                                                  (err && err.message ? err.message : err)),
+                                                'danger');
+                                        });
+                                })
+                            }, stRunning ? 'RUNNING...' : 'AUTO SPEEDTEST')
                         ]),
+                        E('div', {
+                            'class': 'speedtest-line',
+                            'id': 'dash-speedtest-status',
+                            'style': stRunning ? '' : 'display:none;'
+                        }, stRunning ? 'Speedtest running...' : ''),
 
                         E('div', { 'class': 'watchdog-grid' }, [
                             E('span', {}, ['Interval: ', E('b', { 'id': 'dash-interval' }, interval + 's')]),
@@ -325,7 +491,13 @@ return view.extend({
                             'class': 'recovery-line',
                             'id': 'dash-recstate',
                             'style': recState !== 0 ? '' : 'display:none;'
-                        }, 'RECOVERY: ' + (RECOVERY_STATE_LABEL[recState] || '?'))
+                        }, 'RECOVERY: ' + (RECOVERY_STATE_LABEL[recState] || '?')),
+
+                        E('details', { 'class': 'events-block', 'id': 'dash-events-block' }, [
+                            E('summary', { 'id': 'dash-events-summary' },
+                              'Recent events (' + ((s.events && s.events.length) || 0) + ')'),
+                            E('div', { 'class': 'events-list', 'id': 'dash-events-list' }, eventsList)
+                        ])
                     ])
                 ])
             ])
@@ -335,29 +507,9 @@ return view.extend({
 
         requestAnimationFrame(function() {
             loadChartScript().then(function() {
-                var cv = document.getElementById('speedChart');
-                if (!cv) return;
-                var MAX = 30;
-                self.speedChart = new Chart(cv.getContext('2d'), {
-                    type: 'line',
-                    data: {
-                        labels: new Array(MAX).fill(''),
-                        datasets: [
-                            { label: 'Down', data: new Array(MAX).fill(0), borderColor: '#00d2ff', backgroundColor: 'rgba(0,210,255,0.1)', borderWidth: 2, tension: 0.4, pointRadius: 0, fill: true },
-                            { label: 'Up',   data: new Array(MAX).fill(0), borderColor: '#ff3333', backgroundColor: 'rgba(255,51,51,0.1)',   borderWidth: 2, tension: 0.4, pointRadius: 0, fill: true }
-                        ]
-                    },
-                    options: {
-                        responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
-                        plugins: { legend: { display: false } },
-                        scales: { x: { display: false }, y: { display: false, min: 0, suggestedMax: 15 } },
-                        layout: { padding: 0 }
-                    }
-                });
+                self.createChart('speed');
             }).catch(function(err) {
                 console.error('[myhelper] Chart.js load failed:', err);
-                // Replace canvas with explicit "unavailable" message so the user
-                // doesn't see a silent black box.
                 var container = document.getElementById('dash-chart-container');
                 if (container) {
                     container.innerHTML = '';
@@ -378,6 +530,91 @@ return view.extend({
         return root;
     },
 
+    createChart: function(mode) {
+        var cv = document.getElementById('speedChart');
+        if (!cv || !window.Chart) return;
+
+        var config;
+        if (mode === 'speed') {
+            var MAX = 30;
+            config = {
+                type: 'line',
+                data: {
+                    labels: new Array(MAX).fill(''),
+                    datasets: [
+                        { label: 'Down', data: new Array(MAX).fill(0), borderColor: '#00d2ff', backgroundColor: 'rgba(0,210,255,0.1)', borderWidth: 2, tension: 0.4, pointRadius: 0, fill: true },
+                        { label: 'Up',   data: new Array(MAX).fill(0), borderColor: '#ff3333', backgroundColor: 'rgba(255,51,51,0.1)',   borderWidth: 2, tension: 0.4, pointRadius: 0, fill: true }
+                    ]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
+                    plugins: { legend: { display: false } },
+                    scales: { x: { display: false }, y: { display: false, min: 0, suggestedMax: 15 } },
+                    layout: { padding: 0 }
+                }
+            };
+        } else {
+            var s = this.status || {};
+            var key = (mode === 'ping_wan') ? 'history' : 'history_device';
+            var hist = Array.isArray(s[key]) ? s[key] : [];
+            var labels = hist.map(function(_, i) { return String(i); });
+            var data = hist.map(function(sample) {
+                return isOk(sample.ok) ? (Number(sample.rtt_us) / 1000) : null;
+            });
+            var isWan = (mode === 'ping_wan');
+            config = {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: isWan ? 'WAN' : 'Device',
+                        data: data,
+                        borderColor: isWan ? '#f5c451' : '#00d2ff',
+                        backgroundColor: isWan ? 'rgba(245,196,81,0.1)' : 'rgba(0,210,255,0.1)',
+                        borderWidth: 2, tension: 0.3, pointRadius: 0,
+                        spanGaps: false, fill: true
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { display: false },
+                        y: { display: true, min: 0, ticks: { color: '#94a3b8', font: { size: 9 } } }
+                    },
+                    layout: { padding: 0 }
+                }
+            };
+        }
+        this.speedChart = new Chart(cv.getContext('2d'), config);
+        if (mode !== 'speed') this.updatePingChartScale();
+    },
+
+    updatePingChartScale: function() {
+        if (!this.speedChart) return;
+        var data = this.speedChart.data.datasets[0].data;
+        var max = 0;
+        for (var i = 0; i < data.length; i++) {
+            if (Number.isFinite(data[i]) && data[i] > max) max = data[i];
+        }
+        this.speedChart.options.scales.y.suggestedMax = Math.max(50, max * 1.2);
+    },
+
+    switchChartMode: function(mode, btn) {
+        if (this.chartMode === mode) return;
+        this.chartMode = mode;
+
+        var btns = document.querySelectorAll('.myhelper-dashboard .chart-mode-btn');
+        for (var i = 0; i < btns.length; i++) {
+            btns[i].classList.toggle('active', btns[i].dataset.mode === mode);
+        }
+        if (this.speedChart) {
+            this.speedChart.destroy();
+            this.speedChart = null;
+        }
+        this.createChart(mode);
+    },
+
     refreshStatusFields: function() {
         var s = this.status || {};
         var setText = function(id, txt) {
@@ -393,11 +630,22 @@ return view.extend({
         setText('dash-reccnt',   String(Number(s.recovery_count) || 0));
         setText('dash-lastrec',  fmtAgo(s.last_recovery));
 
+        var autoEl = document.getElementById('dash-auto');
+        if (autoEl) autoEl.innerText = fmtSpeedtest(readSpeedtest()) || '';
+
         var internetOn = Number(s.internet) === 1;
+        var probesOk   = Number(s.probes_ok)    || 0;
+        var probesTot  = Number(s.probes_total) || 0;
+        var degraded   = internetOn && probesTot > 0 && probesOk < probesTot;
         var badge = document.getElementById('dash-badge');
         if (badge) {
-            badge.className = internetOn ? 'badge-online' : 'badge-offline';
-            badge.innerText = internetOn ? 'ONLINE' : 'OFFLINE';
+            if (internetOn) {
+                badge.className = degraded ? 'badge-degraded' : 'badge-online';
+                badge.innerText = (probesTot > 0) ? ('ONLINE ' + probesOk + '/' + probesTot) : 'ONLINE';
+            } else {
+                badge.className = 'badge-offline';
+                badge.innerText = (probesTot > 0) ? ('OFFLINE ' + probesOk + '/' + probesTot) : 'OFFLINE';
+            }
         }
 
         var recState = Number(s.recovery_state) || 0;
@@ -410,12 +658,49 @@ return view.extend({
                 recEl.style.display = 'none';
             }
         }
+
+        var stRunning = Number(s.speedtest_running) || 0;
+        var stBtn = document.getElementById('dash-speedtest-btn');
+        var stLine = document.getElementById('dash-speedtest-status');
+        if (stBtn) {
+            stBtn.disabled = !!stRunning;
+            stBtn.innerText = stRunning ? 'RUNNING...' : 'AUTO SPEEDTEST';
+        }
+        if (stLine) {
+            stLine.style.display = stRunning ? '' : 'none';
+            if (stRunning) {
+                var sec = Math.max(0, Math.floor(Date.now() / 1000) - (Number(s.speedtest_start_ts) || 0));
+                stLine.innerText = 'Speedtest running... (' + sec + 's)';
+            }
+        }
+
+        var summary = document.getElementById('dash-events-summary');
+        if (summary) {
+            summary.innerText = 'Recent events (' + ((s.events && s.events.length) || 0) + ')';
+        }
+        var list = document.getElementById('dash-events-list');
+        if (list && Array.isArray(s.events)) {
+            list.innerHTML = '';
+            if (s.events.length === 0) {
+                list.appendChild(E('div', { 'style': 'padding: 6px 0;' }, '— no events yet —'));
+            } else {
+                for (var i = s.events.length - 1; i >= 0; i--) {
+                    var ev = s.events[i];
+                    var meta = EVENT_TYPE_LABEL[Number(ev.type)] || { txt: '?', cls: '' };
+                    list.appendChild(E('div', { 'class': 'ev-row' }, [
+                        E('span', { 'style': 'color: var(--text-muted);' }, fmtClock(ev.ts)),
+                        E('span', { 'class': meta.cls }, meta.txt),
+                        E('span', {}, ev.detail || '')
+                    ]));
+                }
+            }
+        }
     },
 
     startPolling: function() {
         var self = this;
 
-        // Fast: WAN counters, 1s
+        // Fast: WAN counters, 1s. Only touches the chart in 'speed' mode.
         poll.add(function() {
             if (!document.getElementById('speedChart')) return Promise.resolve();
             if (!self.callIfaceStatus) return Promise.resolve();
@@ -440,14 +725,10 @@ return view.extend({
                         if (dEl) dEl.innerText = '↓ ' + rxMbps.toFixed(2) + ' Mb/s';
                         if (uEl) uEl.innerText = '↑ ' + txMbps.toFixed(2) + ' Mb/s';
 
-                        var c = self.speedChart;
-                        if (c) {
+                        if (self.chartMode === 'speed' && self.speedChart) {
+                            var c = self.speedChart;
                             c.data.datasets[0].data.shift(); c.data.datasets[0].data.push(rxMbps);
                             c.data.datasets[1].data.shift(); c.data.datasets[1].data.push(txMbps);
-
-                            // Auto-scale y based on max of last 15 samples
-                            // (recent window, robust to single-sample spikes),
-                            // floor at 15 Mb/s so idle state still looks sane.
                             var d0 = c.data.datasets[0].data, d1 = c.data.datasets[1].data;
                             var start = Math.max(0, d0.length - 15);
                             var maxRecent = 0;
@@ -456,7 +737,6 @@ return view.extend({
                                 if (d1[i] > maxRecent) maxRecent = d1[i];
                             }
                             c.options.scales.y.suggestedMax = Math.max(15, maxRecent * 1.2);
-
                             c.update();
                         }
                     }
@@ -469,8 +749,39 @@ return view.extend({
         poll.add(function() {
             if (!document.getElementById('speedChart')) return Promise.resolve();
             return callStatus().then(function(res) {
+                var prev = self.status || {};
+                var prevRunning = Number(prev.speedtest_running) || 0;
+                var prevLastTs  = Number(prev.speedtest_last_ts) || 0;
+
                 self.status = res || {};
-                self.refreshStatusFields();
+
+                var nowRunning = Number(self.status.speedtest_running) || 0;
+                var nowLastTs  = Number(self.status.speedtest_last_ts)  || 0;
+
+                // If speedtest finished since last poll, reload UCI to pick
+                // up fresh speedtest_download/upload/timestamp values.
+                if (prevRunning === 1 && nowRunning === 0 &&
+                    nowLastTs > prevLastTs) {
+                    uci.load('myhelper').then(function() {
+                        self.refreshStatusFields();
+                    }).catch(function() {
+                        self.refreshStatusFields();
+                    });
+                } else {
+                    self.refreshStatusFields();
+                }
+
+                // Refresh ping chart from new history
+                if (self.chartMode !== 'speed' && self.speedChart) {
+                    var key = (self.chartMode === 'ping_wan') ? 'history' : 'history_device';
+                    var hist = Array.isArray(self.status[key]) ? self.status[key] : [];
+                    self.speedChart.data.labels = hist.map(function(_, i) { return String(i); });
+                    self.speedChart.data.datasets[0].data = hist.map(function(sample) {
+                        return isOk(sample.ok) ? (Number(sample.rtt_us) / 1000) : null;
+                    });
+                    self.updatePingChartScale();
+                    self.speedChart.update();
+                }
             }).catch(function() { /* daemon temporarily unavailable */ });
         }, POLL_STATUS);
     }
