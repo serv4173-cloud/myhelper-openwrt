@@ -6,20 +6,13 @@
 'require dom';
 'require poll';
 
-// --- Module-level RPC declarations (stable methods) ---
 var callStatus        = rpc.declare({ object: 'myhelper', method: 'status' });
 var callForceRecovery = rpc.declare({ object: 'myhelper', method: 'force_recovery' });
 var callQosReapply    = rpc.declare({ object: 'myhelper', method: 'qos_reapply' });
-var callDhcpLeases    = rpc.declare({ object: 'dhcp', method: 'ipv4leases' });
 
-// Poll intervals (seconds)
 var POLL_STATS  = 1;   // WAN rx/tx counters
-var POLL_STATUS = 5;   // daemon status (heavy: history array)
+var POLL_STATUS = 5;   // myhelper status (history arrays — heavy)
 
-// Module-level guard: register poll handlers exactly once per page lifetime.
-var _pollRegistered = false;
-
-// Lazy Chart.js loader (local copy under luci-static/resources/view/myhelper/)
 var loadChartScript = function() {
     return new Promise(function(resolve, reject) {
         if (window.Chart) return resolve();
@@ -31,81 +24,75 @@ var loadChartScript = function() {
     });
 };
 
-// Contract: status.history[N] = { ok: bool, rtt_us: int }
-// Defensive: any shape mismatch (NaN/undefined/null/negative) → 'err'.
-var parseLastPing = function(s) {
-    if (!s || !Array.isArray(s.history) || s.history.length === 0) return '---';
-    var last = s.history[s.history.length - 1];
-    if (!last || last.ok !== true) return 'timeout';
+var isOk = function(v) {
+    if (v === true)  return true;
+    if (v === false) return false;
+    if (typeof v === 'number') return v !== 0;
+    if (typeof v === 'string') return (v === '1' || v.toLowerCase() === 'true');
+    return false;
+};
+
+var parseLastPing = function(s, key) {
+    if (!s || !Array.isArray(s[key]) || s[key].length === 0) return '---';
+    var last = s[key][s[key].length - 1];
+    if (!last || !isOk(last.ok)) return 'timeout';
     var rtt = Number(last.rtt_us);
     if (!Number.isFinite(rtt) || rtt < 0) return 'err';
     return (rtt / 1000).toFixed(0) + ' ms';
 };
 
-// UCI field is `myhelper.settings.enabled` (confirmed from init script).
-// Daemon may echo it back as `enabled`, `qos_enabled` or `game_boost` — try all.
-// Returns null if unknown → caller falls back to UCI.
-var parseDaemonEnabled = function(s) {
-    if (!s) return null;
-    if (typeof s.enabled     === 'boolean') return s.enabled;
-    if (typeof s.qos_enabled === 'boolean') return s.qos_enabled;
-    if (typeof s.game_boost  === 'boolean') return s.game_boost;
-    return null;
+var fmtUptime = function(sec) {
+    sec = Math.floor(Number(sec) || 0);
+    if (sec < 60)    return sec + 's';
+    if (sec < 3600)  return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's';
+    if (sec < 86400) return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
+    return Math.floor(sec / 86400) + 'd ' + Math.floor((sec % 86400) / 3600) + 'h';
 };
 
-var syncToggleFromDaemon = function(enabled) {
-    if (enabled === null) return;
-    var el = document.getElementById('dash-toggle');
-    if (!el) return;
-    if (enabled) el.classList.add('active');
-    else         el.classList.remove('active');
+var fmtAgo = function(ts) {
+    ts = Number(ts) || 0;
+    if (ts <= 0) return 'never';
+    var sec = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+    if (sec < 60)    return sec + 's ago';
+    if (sec < 3600)  return Math.floor(sec / 60) + 'm ago';
+    if (sec < 86400) return Math.floor(sec / 3600) + 'h ago';
+    return Math.floor(sec / 86400) + 'd ago';
 };
 
-// Speedtest stored in settings.* (after shell fix) — fallback to legacy
-// game_boost.* section for routers that ran the old speedtest() once.
+var RECOVERY_STATE_LABEL = ['idle', 'down', 'delay', 'up', 'ifup'];
+
 var readSpeedtest = function() {
-    var dl = uci.get('myhelper', 'settings', 'speedtest_download')
-          || uci.get('myhelper', 'game_boost', 'speedtest_download');
-    var ul = uci.get('myhelper', 'settings', 'speedtest_upload')
-          || uci.get('myhelper', 'game_boost', 'speedtest_upload');
-    var ts = uci.get('myhelper', 'settings', 'speedtest_timestamp')
-          || uci.get('myhelper', 'game_boost', 'speedtest_timestamp');
-    return { dl: dl, ul: ul, ts: ts };
+    return {
+        dl: uci.get('myhelper', 'settings', 'speedtest_download')
+         || uci.get('myhelper', 'game_boost', 'speedtest_download'),
+        ul: uci.get('myhelper', 'settings', 'speedtest_upload')
+         || uci.get('myhelper', 'game_boost', 'speedtest_upload'),
+        ts: uci.get('myhelper', 'settings', 'speedtest_timestamp')
+         || uci.get('myhelper', 'game_boost', 'speedtest_timestamp')
+    };
 };
 
 var fmtSpeedtest = function(st) {
     if (!st || (!st.dl && !st.ul)) return null;
     var dlM = (Number(st.dl) > 0) ? (Number(st.dl) / 1000).toFixed(1) : '?';
     var ulM = (Number(st.ul) > 0) ? (Number(st.ul) / 1000).toFixed(1) : '?';
-    var ago = '';
-    if (st.ts) {
-        var sec = Math.max(0, Math.floor(Date.now() / 1000) - Number(st.ts));
-        if (Number.isFinite(sec)) {
-            ago = (sec < 3600)
-                ? ' (' + Math.floor(sec / 60) + ' min ago)'
-                : ' (' + Math.floor(sec / 3600) + ' h ago)';
-        }
-    }
-    return 'Auto: ↓' + dlM + ' ↑' + ulM + ' Mb/s' + ago;
+    return 'Auto: ↓' + dlM + ' ↑' + ulM + ' Mb/s' + (st.ts ? ' (' + fmtAgo(st.ts) + ')' : '');
 };
 
 return view.extend({
     speedChart: null,
     lastBytes: null,
     status: null,
-    leases: null,
     wanIface: 'wan',
     callIfaceStatus: null,
-    _pendingToggle: false,   // user toggled → Save & Apply not yet confirmed
+    _pollingStarted: false,
 
     load: function() {
         var self = this;
         return Promise.all([
             uci.load('myhelper'),
-            callStatus().then(function(r) { self.status = r || {}; }).catch(function() { self.status = {}; }),
-            callDhcpLeases().then(function(r) { self.leases = r || {}; }).catch(function() { self.leases = {}; })
+            callStatus().then(function(r) { self.status = r || {}; }).catch(function() { self.status = {}; })
         ]).then(function() {
-            // Dynamically bind WAN interface RPC — UCI may have renamed it.
             self.wanIface = uci.get('myhelper', 'settings', 'wan_iface') || 'wan';
             self.callIfaceStatus = rpc.declare({
                 object: 'network.interface.' + self.wanIface,
@@ -118,17 +105,26 @@ return view.extend({
         var self = this;
         var s = this.status || {};
 
-        // Prefer daemon's real state, fall back to UCI.
-        var daemonEn = parseDaemonEnabled(s);
-        var gbEnabled = (daemonEn !== null)
-            ? daemonEn
-            : (uci.get('myhelper', 'settings', 'enabled') === '1');
+        var gbEnabled = uci.get('myhelper', 'settings', 'enabled') === '1';
 
-        var preset   = uci.get('myhelper', 'settings', 'qos_preset')        || 'balanced';
-        var bwDown   = uci.get('myhelper', 'settings', 'bandwidth_download')|| '0';
-        var bwUp     = uci.get('myhelper', 'settings', 'bandwidth_upload')  || '0';
-        var lastPing = parseLastPing(s);
+        var preset   = uci.get('myhelper', 'settings', 'qos_preset')         || 'balanced';
+        var bwDown   = uci.get('myhelper', 'settings', 'bandwidth_download') || '0';
+        var bwUp     = uci.get('myhelper', 'settings', 'bandwidth_upload')   || '0';
         var autoStr  = fmtSpeedtest(readSpeedtest());
+
+        var wanPing  = parseLastPing(s, 'history');
+        var devPing  = (typeof s.gaming_ip === 'string' && s.gaming_ip.length)
+                       ? parseLastPing(s, 'history_device') : null;
+        var gamingIp = (typeof s.gaming_ip === 'string' && s.gaming_ip.length) ? s.gaming_ip : null;
+
+        var internetOn = Number(s.internet) === 1;
+        var failCnt    = Number(s.fail_count)     || 0;
+        var threshold  = Number(s.threshold)      || 0;
+        var interval   = Number(s.interval)       || 0;
+        var uptime     = Number(s.uptime)         || 0;
+        var recCnt     = Number(s.recovery_count) || 0;
+        var lastRec    = Number(s.last_recovery)  || 0;
+        var recState   = Number(s.recovery_state) || 0;
 
         var css = E('style', {}, `
             .myhelper-dashboard {
@@ -168,6 +164,7 @@ return view.extend({
             .myhelper-dashboard .label-internet { color: #00ffcc; font-weight: bold; }
             .myhelper-dashboard .label-ping { color: var(--accent-gold); font-weight: bold; }
             .myhelper-dashboard .badge-online { background: rgba(34, 197, 94, 0.15); color: var(--accent-green); padding: 2px 6px; border-radius: 4px; font-size: 10px; }
+            .myhelper-dashboard .badge-offline { background: rgba(255, 51, 51, 0.15); color: var(--accent-red); padding: 2px 6px; border-radius: 4px; font-size: 10px; }
             .myhelper-dashboard .chart-container { height: 100px; width: 100%; background: rgba(0,0,0,0.5); border-radius: 4px; margin-top: 10px; }
             .myhelper-dashboard .btn {
                 padding: 8px 12px; border-radius: 4px; border: none; font-weight: bold; cursor: pointer; font-size: 11px; text-transform: uppercase;
@@ -183,22 +180,41 @@ return view.extend({
             .myhelper-dashboard .toggle-switch.active { background: var(--accent-green); box-shadow: 0 0 10px rgba(34, 197, 94, 0.6); }
             .myhelper-dashboard .toggle-switch.active::after { transform: translateX(18px); }
             .myhelper-dashboard .auto-line { font-size: 10px; color: var(--text-muted); margin-top: 4px; }
+            .myhelper-dashboard .watchdog-grid {
+                display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px;
+                font-size: 10px; color: var(--text-muted);
+                border-top: 1px solid rgba(255,255,255,0.08);
+                padding-top: 10px; margin-top: 10px;
+            }
+            .myhelper-dashboard .watchdog-grid b { color: var(--text-main); font-weight: 600; }
+            .myhelper-dashboard .recovery-line {
+                font-size: 10px; color: var(--accent-gold); font-weight: bold;
+                margin-top: 6px; text-transform: uppercase; letter-spacing: 0.5px;
+            }
         `);
 
         var dashboard = E('div', { 'class': 'myhelper-dashboard' }, [
             E('div', { 'class': 'dashboard-grid' }, [
-                // LEFT COLUMN
                 E('div', {}, [
                     E('div', { 'class': 'panel' }, [
                         E('div', { 'class': 'panel-header' }, 'LIVE STATUS'),
                         E('div', { 'class': 'status-row' }, [
                             E('span', { 'class': 'label-internet' }, 'INTERNET'),
-                            E('span', { 'class': 'badge-online' }, s.internet ? 'ONLINE' : 'OFFLINE')
+                            E('span', { 'class': internetOn ? 'badge-online' : 'badge-offline', 'id': 'dash-badge' },
+                                       internetOn ? 'ONLINE' : 'OFFLINE')
                         ]),
                         E('div', { 'class': 'status-row' }, [
-                            E('span', { 'class': 'label-ping' }, 'CURRENT PING'),
-                            E('span', { 'id': 'dash-ping', 'class': 'text-yellow' }, lastPing)
+                            E('span', { 'class': 'label-ping' }, 'WAN PING'),
+                            E('span', { 'id': 'dash-ping' }, wanPing)
                         ]),
+                        devPing !== null ? E('div', { 'class': 'status-row' }, [
+                            E('span', { 'style': 'color: var(--accent-gold);' }, 'DEVICE PING'),
+                            E('span', { 'id': 'dash-devping' }, devPing)
+                        ]) : null,
+                        gamingIp ? E('div', { 'class': 'status-row' }, [
+                            E('span', { 'style': 'color: var(--accent-gold);' }, 'BOOSTED IP'),
+                            E('span', { 'id': 'dash-gamingip', 'style': 'font-family: monospace;' }, gamingIp)
+                        ]) : null,
                         E('div', { 'class': 'status-row' }, [
                             E('span', { 'style': 'color: var(--accent-blue);' }, 'LIVE SPEED'),
                             E('span', {}, [
@@ -207,12 +223,11 @@ return view.extend({
                                 E('span', { 'id': 'dash-up',   'style': 'color: #ff3333; font-weight:bold;' }, '↑ 0.00 Mb/s')
                             ])
                         ]),
-                        E('div', { 'class': 'chart-container' }, [
+                        E('div', { 'class': 'chart-container', 'id': 'dash-chart-container' }, [
                             E('canvas', { 'id': 'speedChart' })
                         ])
                     ])
                 ]),
-                // RIGHT COLUMN
                 E('div', {}, [
                     E('div', { 'class': 'panel' }, [
                         E('div', { 'class': 'panel-header' }, 'GAME BOOST'),
@@ -227,9 +242,9 @@ return view.extend({
                                     var el = ev.target;
                                     var willEnable = !el.classList.contains('active');
                                     el.classList.toggle('active');
-                                    self._pendingToggle = true;
                                     uci.set('myhelper', 'settings', 'enabled', willEnable ? '1' : '0');
-                                    ui.addNotification(null, E('p', _('Game Boost change pending. Click Save & Apply.')), 'info');
+                                    ui.addNotification(null,
+                                        E('p', _('Game Boost change pending. Click Save & Apply.')), 'info');
                                 })
                             }),
                             E('span', { 'style': 'font-size: 11px; font-weight: bold;' }, 'ENABLE GAME BOOST')
@@ -240,14 +255,21 @@ return view.extend({
                                 'click': ui.createHandlerFn(this, function() {
                                     uci.save()
                                         .then(function() { return callQosReapply(); })
-                                        .then(function() { return callStatus(); })
+                                        .then(function(r) {
+                                            if (!r || Number(r.ok) !== 1) {
+                                                throw new Error('qos_reapply failed (ok=' +
+                                                                (r && r.ok) + ', rc=' + (r && r.rc) + ')');
+                                            }
+                                            return callStatus();
+                                        })
                                         .then(function(res) {
                                             self.status = res || {};
-                                            self._pendingToggle = false;
-                                            syncToggleFromDaemon(parseDaemonEnabled(self.status));
-                                            var pingEl = document.getElementById('dash-ping');
-                                            if (pingEl) pingEl.innerText = parseLastPing(self.status);
-                                            ui.addNotification(null, E('p', _('Configuration applied.')), 'info');
+                                            var tEl = document.getElementById('dash-toggle');
+                                            if (tEl) tEl.classList.toggle('active',
+                                                uci.get('myhelper', 'settings', 'enabled') === '1');
+                                            self.refreshStatusFields();
+                                            ui.addNotification(null,
+                                                E('p', _('Configuration saved and applied.')), 'info');
                                         })
                                         .catch(function(err) {
                                             console.error('[myhelper] apply failed:', err);
@@ -261,17 +283,49 @@ return view.extend({
                                 'class': 'btn btn-outline',
                                 'click': ui.createHandlerFn(this, function() {
                                     if (confirm(_('Force WAN Recovery?'))) {
-                                        callForceRecovery().then(function() {
-                                            ui.addNotification(null, E('p', _('Recovery triggered.')), 'warning');
-                                        }).catch(function(err) {
-                                            ui.addNotification(null,
-                                                E('p', _('Recovery failed: ') + (err && err.message ? err.message : err)),
-                                                'danger');
-                                        });
+                                        callForceRecovery()
+                                            .then(function(r) {
+                                                if (!r || Number(r.ok) !== 1) {
+                                                    if (r && Number(r.busy) === 1)
+                                                        throw new Error(_('Recovery already in progress'));
+                                                    throw new Error('force_recovery not acknowledged');
+                                                }
+                                                ui.addNotification(null,
+                                                    E('p', _('Recovery started. Total: ') +
+                                                      (r.recovery_count || '?') + ' run(s).'),
+                                                    'warning');
+                                                return callStatus();
+                                            })
+                                            .then(function(res) {
+                                                if (res) {
+                                                    self.status = res;
+                                                    self.refreshStatusFields();
+                                                }
+                                            })
+                                            .catch(function(err) {
+                                                ui.addNotification(null,
+                                                    E('p', _('Recovery failed: ') +
+                                                      (err && err.message ? err.message : err)),
+                                                    'danger');
+                                            });
                                     }
                                 })
                             }, 'FORCE RECOVERY')
-                        ])
+                        ]),
+
+                        E('div', { 'class': 'watchdog-grid' }, [
+                            E('span', {}, ['Interval: ', E('b', { 'id': 'dash-interval' }, interval + 's')]),
+                            E('span', {}, ['Fail: ',     E('b', { 'id': 'dash-fail' },     failCnt + ' / ' + threshold)]),
+                            E('span', {}, ['Uptime: ',   E('b', { 'id': 'dash-uptime' },   fmtUptime(uptime))]),
+                            E('span', {}, ['Recoveries: ', E('b', { 'id': 'dash-reccnt' }, String(recCnt))]),
+                            E('span', { 'style': 'grid-column: 1 / -1;' },
+                              ['Last recovery: ', E('b', { 'id': 'dash-lastrec' }, fmtAgo(lastRec))])
+                        ]),
+                        E('div', {
+                            'class': 'recovery-line',
+                            'id': 'dash-recstate',
+                            'style': recState !== 0 ? '' : 'display:none;'
+                        }, 'RECOVERY: ' + (RECOVERY_STATE_LABEL[recState] || '?'))
                     ])
                 ])
             ])
@@ -279,7 +333,6 @@ return view.extend({
 
         var root = E('div', {}, [css, dashboard]);
 
-        // Chart.js init — after canvas is committed to DOM.
         requestAnimationFrame(function() {
             loadChartScript().then(function() {
                 var cv = document.getElementById('speedChart');
@@ -303,23 +356,70 @@ return view.extend({
                 });
             }).catch(function(err) {
                 console.error('[myhelper] Chart.js load failed:', err);
+                // Replace canvas with explicit "unavailable" message so the user
+                // doesn't see a silent black box.
+                var container = document.getElementById('dash-chart-container');
+                if (container) {
+                    container.innerHTML = '';
+                    container.appendChild(E('div', {
+                        'style': 'display:flex; align-items:center; justify-content:center; ' +
+                                 'height:100%; color:#ff3333; font-size:10px; ' +
+                                 'text-align:center; padding: 4px; line-height: 1.3;'
+                    }, 'Chart unavailable (chart.umd.min.js not found)'));
+                }
             });
         });
 
-        if (!_pollRegistered) {
-            _pollRegistered = true;
+        if (!this._pollingStarted) {
+            this._pollingStarted = true;
             this.startPolling();
         }
 
         return root;
     },
 
+    refreshStatusFields: function() {
+        var s = this.status || {};
+        var setText = function(id, txt) {
+            var el = document.getElementById(id);
+            if (el) el.innerText = txt;
+        };
+        setText('dash-ping',     parseLastPing(s, 'history'));
+        setText('dash-devping',  parseLastPing(s, 'history_device'));
+        setText('dash-gamingip', s.gaming_ip || '—');
+        setText('dash-interval', (Number(s.interval) || 0) + 's');
+        setText('dash-fail',     (Number(s.fail_count) || 0) + ' / ' + (Number(s.threshold) || 0));
+        setText('dash-uptime',   fmtUptime(s.uptime));
+        setText('dash-reccnt',   String(Number(s.recovery_count) || 0));
+        setText('dash-lastrec',  fmtAgo(s.last_recovery));
+
+        var internetOn = Number(s.internet) === 1;
+        var badge = document.getElementById('dash-badge');
+        if (badge) {
+            badge.className = internetOn ? 'badge-online' : 'badge-offline';
+            badge.innerText = internetOn ? 'ONLINE' : 'OFFLINE';
+        }
+
+        var recState = Number(s.recovery_state) || 0;
+        var recEl = document.getElementById('dash-recstate');
+        if (recEl) {
+            if (recState !== 0) {
+                recEl.style.display = '';
+                recEl.innerText = 'RECOVERY: ' + (RECOVERY_STATE_LABEL[recState] || '?');
+            } else {
+                recEl.style.display = 'none';
+            }
+        }
+    },
+
     startPolling: function() {
         var self = this;
 
-        // ---- FAST POLL: WAN rx/tx counters, 1s ----
+        // Fast: WAN counters, 1s
         poll.add(function() {
+            if (!document.getElementById('speedChart')) return Promise.resolve();
             if (!self.callIfaceStatus) return Promise.resolve();
+
             return self.callIfaceStatus().then(function(res) {
                 if (!res || !res.statistics) return;
 
@@ -332,7 +432,6 @@ return view.extend({
                     if (dt > 0) {
                         var rxMbps = ((rx - self.lastBytes.rx) * 8 / 1e6 / dt);
                         var txMbps = ((tx - self.lastBytes.tx) * 8 / 1e6 / dt);
-                        // Counter wrap/reset → negative rate. Clamp to 0.
                         if (!Number.isFinite(rxMbps) || rxMbps < 0) rxMbps = 0;
                         if (!Number.isFinite(txMbps) || txMbps < 0) txMbps = 0;
 
@@ -345,28 +444,34 @@ return view.extend({
                         if (c) {
                             c.data.datasets[0].data.shift(); c.data.datasets[0].data.push(rxMbps);
                             c.data.datasets[1].data.shift(); c.data.datasets[1].data.push(txMbps);
+
+                            // Auto-scale y based on max of last 15 samples
+                            // (recent window, robust to single-sample spikes),
+                            // floor at 15 Mb/s so idle state still looks sane.
+                            var d0 = c.data.datasets[0].data, d1 = c.data.datasets[1].data;
+                            var start = Math.max(0, d0.length - 15);
+                            var maxRecent = 0;
+                            for (var i = start; i < d0.length; i++) {
+                                if (d0[i] > maxRecent) maxRecent = d0[i];
+                                if (d1[i] > maxRecent) maxRecent = d1[i];
+                            }
+                            c.options.scales.y.suggestedMax = Math.max(15, maxRecent * 1.2);
+
                             c.update();
                         }
                     }
                 }
                 self.lastBytes = { rx: rx, tx: tx, time: now };
-            }).catch(function() { /* transient WAN down — ignore */ });
+            }).catch(function() { /* transient WAN down */ });
         }, POLL_STATS);
 
-        // ---- SLOW POLL: daemon status, 5s ----
+        // Slow: daemon status, 5s
         poll.add(function() {
+            if (!document.getElementById('speedChart')) return Promise.resolve();
             return callStatus().then(function(res) {
                 self.status = res || {};
-
-                var pingEl = document.getElementById('dash-ping');
-                if (pingEl) pingEl.innerText = parseLastPing(self.status);
-
-                // Only sync toggle when user has no unapplied change.
-                // Catches daemon self-recovery, watchdog rollback, external CLI.
-                if (!self._pendingToggle) {
-                    syncToggleFromDaemon(parseDaemonEnabled(self.status));
-                }
+                self.refreshStatusFields();
             }).catch(function() { /* daemon temporarily unavailable */ });
         }, POLL_STATUS);
     }
-}); 
+});
