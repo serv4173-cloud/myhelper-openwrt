@@ -5,6 +5,14 @@
  * Two independent ICMP probes:
  *   - Internet health (1.1.1.1 / 8.8.8.8) -> g_history
  *   - Gaming device health (from /tmp/myhelper_gaming_ip) -> g_history_device
+ *
+ * RTT for internet probes is the minimum among successful children in a
+ * round, not "time until last child exits" (previous behaviour, which
+ * reported 3000 ms whenever one host timed out and another replied fast).
+ *
+ * WAN recovery is fully async: ubus down -> 2s uloop_timeout -> ubus up
+ * -> ifup fallback. The daemon never blocks on sleep(); ubus handlers
+ * (including "status" from LuCI JS) keep working during recovery.
  */
 
 #include <stdio.h>
@@ -39,6 +47,7 @@
 #define HISTORY_SIZE          120
 #define MAX_PROBES            4
 #define QOS_REAPPLY_DELAY_MS  8000
+#define RECOVERY_DOWN_UP_DELAY_MS 2000
 #define HISTORY_FILE          "/tmp/myhelper_history.json"
 #define HISTORY_FLUSH_EVERY   10
 #define HISTORY_VERSION       1
@@ -106,19 +115,37 @@ static const char *g_probe_hosts[MAX_PROBES] = { "1.1.1.1", "8.8.8.8", NULL };
 
 static char g_gaming_ip[INET_ADDRSTRLEN] = "";
 
-/* ---------------- Probe orchestration state ---------------- */
+/* ---------------- Probe orchestration state ----------------
+ * RTT is tracked per-child (each child has its own start_us), then the
+ * minimum among SUCCESSFUL children becomes the round's rtt_us.
+ */
 struct probe_child {
     struct uloop_process proc;
     int                  is_device;
+    uint64_t             start_us;   /* set right before fork() */
 };
 
 static int      g_net_pending   = 0;
 static int      g_net_alive     = 0;
-static uint64_t g_net_start_us  = 0;
+static uint32_t g_net_rtt_us    = 0;   /* min of successful children this round */
 
 static int      g_dev_pending   = 0;
 static int      g_dev_alive     = 0;
-static uint64_t g_dev_start_us  = 0;
+static uint32_t g_dev_rtt_us    = 0;   /* min of successful children this round */
+
+/* ---------------- Async WAN recovery state ---------------- */
+#define RECOVERY_IDLE   0
+#define RECOVERY_DOWN   1
+#define RECOVERY_DELAY  2
+#define RECOVERY_UP     3
+#define RECOVERY_IFUP   4
+
+static int                   g_recovery_state   = RECOVERY_IDLE;
+static struct uloop_process  g_recovery_proc;      /* reused across steps */
+static struct uloop_timeout  g_recovery_delay_timer;
+static int                   g_recovery_rc_down = -1;
+static int                   g_recovery_rc_up   = -1;
+static int                   g_recovery_rc_ifup = -1;
 
 /* ---------------- uloop / ubus ---------------- */
 static struct uloop_timeout  g_check_timer;
@@ -132,8 +159,8 @@ static void handle_device_probe_result(int alive, uint32_t rtt_us);
 static void start_probe(void);
 static void start_device_probe(void);
 static void history_save(void);
-static void reapply_game_qos(void);
-static void recover_wan(void);
+static int  reapply_game_qos(void);
+static int  recover_wan(void);
 
 /* ============================================================
  *  Utilities
@@ -334,12 +361,11 @@ static void history_push(int ok, uint32_t rtt_us)
     }
 }
 
-/* FIX: also drive the flush counter from device samples, so
- * history_device is persisted every ~10 samples regardless of
- * whether internet samples happen to be due. Uses the shared
- * counter — no double-flush in a single tick, because the
- * increment-before-check pattern guarantees at most one flush
- * per push. */
+/* FIX (flush): also drive the flush counter from device samples, so
+ * history_device is persisted every ~10 samples regardless of whether
+ * internet samples happen to be due. Shared counter — no double-flush
+ * in a single tick, because increment-before-check guarantees at most
+ * one flush per push. */
 static void history_push_device(int ok, uint32_t rtt_us)
 {
     g_history_device[g_history_device_idx].ok     = (uint8_t)ok;
@@ -409,7 +435,9 @@ static int ping_host(const char *host, int timeout_sec)
 /* ============================================================
  *  Process helpers
  * ============================================================ */
-static int run_command(const char *path, char *const argv[])
+/* Non-blocking fork+exec. Returns pid (>0) on success, -1 on failure.
+ * The child's exit status is delivered via uloop_process_add() .cb. */
+static pid_t spawn_command(const char *path, char *const argv[])
 {
     pid_t pid = fork();
     if (pid < 0) return -1;
@@ -419,38 +447,153 @@ static int run_command(const char *path, char *const argv[])
         execv(path, argv);
         _exit(127);
     }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) return -1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    return pid;
 }
 
-static void recover_wan(void)
+/* ============================================================
+ *  Async WAN recovery
+ *
+ *   IDLE --recover_wan()--> DOWN (fork ubus down)
+ *   DOWN --child exit--> DELAY (2s uloop_timeout)
+ *   DELAY --timeout--> UP (fork ubus up)
+ *   UP --child exit ok--> IDLE
+ *   UP --child exit err--> IFUP (fork ifup)
+ *   IFUP --child exit--> IDLE
+ *
+ * Any step's fork failure falls through to the next step, so we never
+ * get stuck. The whole sequence takes ~2.2s wall time but uloop stays
+ * responsive throughout.
+ * ============================================================ */
+static void recovery_reset(void)
 {
-    MY_LOG(LOG_WARNING, "Attempting WAN recovery (interface=%s)", cfg_wan);
-    char iface_path[64];
-    snprintf(iface_path, sizeof(iface_path),
-             "network.interface.%s", cfg_wan);
+    g_recovery_state   = RECOVERY_IDLE;
+    g_recovery_rc_down = -1;
+    g_recovery_rc_up   = -1;
+    g_recovery_rc_ifup = -1;
+}
 
-    char *down_argv[] = { "ubus", "call", iface_path, "down", NULL };
-    char *up_argv[]   = { "ubus", "call", iface_path, "up",   NULL };
+static void recovery_ifup_cb(struct uloop_process *p, int ret)
+{
+    (void)p;
+    g_recovery_rc_ifup = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) ? 0 : -1;
+    MY_LOG(LOG_WARNING, "ifup %s fallback rc=%d", cfg_wan, g_recovery_rc_ifup);
+    MY_LOG(LOG_INFO, "WAN recovery completed (ifup fallback)");
+    recovery_reset();
+}
+
+static void recovery_start_ifup(void)
+{
+    MY_LOG(LOG_WARNING, "ubus up failed, trying ifup %s fallback", cfg_wan);
+
     char *ifup_argv[] = { "ifup", cfg_wan, NULL };
+    g_recovery_state = RECOVERY_IFUP;
 
-    int rc_down = run_command("/sbin/ubus", down_argv);
-    MY_LOG(LOG_INFO, "ubus down rc=%d", rc_down);
-    sleep(2);
-    int rc_up = run_command("/sbin/ubus", up_argv);
-    MY_LOG(LOG_INFO, "ubus up rc=%d", rc_up);
-
-    if (rc_down != 0 || rc_up != 0) {
-        int rc = run_command("/sbin/ifup", ifup_argv);
-        MY_LOG(LOG_WARNING, "ifup %s fallback rc=%d", cfg_wan, rc);
+    memset(&g_recovery_proc, 0, sizeof(g_recovery_proc));
+    g_recovery_proc.cb  = recovery_ifup_cb;
+    g_recovery_proc.pid = spawn_command("/sbin/ifup", ifup_argv);
+    if (g_recovery_proc.pid > 0) {
+        uloop_process_add(&g_recovery_proc);
+    } else {
+        MY_LOG(LOG_ERR, "ifup spawn failed, recovery aborted");
+        recovery_reset();
     }
 }
 
-static void reapply_game_qos(void)
+static void recovery_up_cb(struct uloop_process *p, int ret)
+{
+    (void)p;
+    g_recovery_rc_up = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) ? 0 : -1;
+    MY_LOG(LOG_INFO, "ubus up rc=%d", g_recovery_rc_up);
+
+    if (g_recovery_rc_down != 0 || g_recovery_rc_up != 0) {
+        recovery_start_ifup();
+    } else {
+        MY_LOG(LOG_INFO, "WAN recovery completed (ubus down+up)");
+        recovery_reset();
+    }
+}
+
+static void recovery_start_up(void)
+{
+    MY_LOG(LOG_INFO, "Recovery: bringing WAN up");
+
+    char iface_path[64];
+    snprintf(iface_path, sizeof(iface_path), "network.interface.%s", cfg_wan);
+    char *up_argv[] = { "ubus", "call", iface_path, "up", NULL };
+
+    g_recovery_state = RECOVERY_UP;
+
+    memset(&g_recovery_proc, 0, sizeof(g_recovery_proc));
+    g_recovery_proc.cb  = recovery_up_cb;
+    g_recovery_proc.pid = spawn_command("/sbin/ubus", up_argv);
+    if (g_recovery_proc.pid > 0) {
+        uloop_process_add(&g_recovery_proc);
+    } else {
+        MY_LOG(LOG_ERR, "ubus up spawn failed");
+        g_recovery_rc_up = -1;
+        recovery_start_ifup();
+    }
+}
+
+static void recovery_delay_cb(struct uloop_timeout *t)
+{
+    (void)t;
+    recovery_start_up();
+}
+
+static void recovery_down_cb(struct uloop_process *p, int ret)
+{
+    (void)p;
+    g_recovery_rc_down = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) ? 0 : -1;
+    MY_LOG(LOG_INFO, "ubus down rc=%d", g_recovery_rc_down);
+
+    /* 2-second pause between down and up, but via uloop — NOT sleep(). */
+    g_recovery_state = RECOVERY_DELAY;
+    uloop_timeout_set(&g_recovery_delay_timer, RECOVERY_DOWN_UP_DELAY_MS);
+}
+
+/* Returns 0 if recovery was started, -1 if one is already in progress. */
+static int recover_wan(void)
+{
+    if (g_recovery_state != RECOVERY_IDLE) {
+        MY_LOG(LOG_INFO, "Recovery already in progress (state=%d), ignoring",
+               g_recovery_state);
+        return -1;
+    }
+
+    MY_LOG(LOG_WARNING, "Attempting WAN recovery (interface=%s)", cfg_wan);
+
+    char iface_path[64];
+    snprintf(iface_path, sizeof(iface_path), "network.interface.%s", cfg_wan);
+    char *down_argv[] = { "ubus", "call", iface_path, "down", NULL };
+
+    recovery_reset();
+    g_recovery_state = RECOVERY_DOWN;
+
+    memset(&g_recovery_proc, 0, sizeof(g_recovery_proc));
+    g_recovery_proc.cb  = recovery_down_cb;
+    g_recovery_proc.pid = spawn_command("/sbin/ubus", down_argv);
+    if (g_recovery_proc.pid > 0) {
+        uloop_process_add(&g_recovery_proc);
+    } else {
+        MY_LOG(LOG_ERR, "ubus down spawn failed, still scheduling up in 2s");
+        g_recovery_rc_down = -1;
+        g_recovery_state   = RECOVERY_DELAY;
+        uloop_timeout_set(&g_recovery_delay_timer, RECOVERY_DOWN_UP_DELAY_MS);
+    }
+    return 0;
+}
+
+/* ============================================================
+ *  QoS reapply (synchronous — short; result reported to ubus)
+ * ============================================================ */
+static int reapply_game_qos(void)
 {
     pid_t pid = fork();
-    if (pid < 0) return;
+    if (pid < 0) {
+        MY_LOG(LOG_ERR, "reapply_game_qos fork failed: %s", strerror(errno));
+        return -1;
+    }
     if (pid == 0) {
         freopen("/dev/null", "w", stdout);
         freopen("/dev/null", "w", stderr);
@@ -458,8 +601,22 @@ static void reapply_game_qos(void)
               "myhelper-watchdog", "apply_qos", (char *)NULL);
         _exit(127);
     }
-    waitpid(pid, NULL, 0);
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        MY_LOG(LOG_ERR, "waitpid failed: %s", strerror(errno));
+        return -1;
+    }
     refresh_gaming_ip();
+
+    if (!WIFEXITED(status)) {
+        MY_LOG(LOG_WARNING, "apply_qos terminated abnormally (status=0x%x)", status);
+        return -1;
+    }
+    int rc = WEXITSTATUS(status);
+    if (rc != 0)
+        MY_LOG(LOG_WARNING, "apply_qos exited rc=%d", rc);
+    return rc;
 }
 
 /* ============================================================
@@ -470,20 +627,28 @@ static void probe_child_cb(struct uloop_process *p, int ret)
     struct probe_child *pc = container_of(p, struct probe_child, proc);
     int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
 
+    /* FIX (rtt): per-child elapsed time, not "time until last child exits".
+     * Only successful children contribute; keep the minimum. */
     if (pc->is_device) {
-        if (ok) g_dev_alive = 1;
+        if (ok) {
+            uint32_t rtt = (uint32_t)(now_us() - pc->start_us);
+            g_dev_alive = 1;
+            if (g_dev_rtt_us == 0 || rtt < g_dev_rtt_us)
+                g_dev_rtt_us = rtt;
+        }
         g_dev_pending--;
-        if (g_dev_pending == 0) {
-            uint32_t rtt = (uint32_t)(now_us() - g_dev_start_us);
-            handle_device_probe_result(g_dev_alive, rtt);
-        }
+        if (g_dev_pending == 0)
+            handle_device_probe_result(g_dev_alive, g_dev_rtt_us);
     } else {
-        if (ok) g_net_alive = 1;
-        g_net_pending--;
-        if (g_net_pending == 0) {
-            uint32_t rtt = (uint32_t)(now_us() - g_net_start_us);
-            handle_probe_result(g_net_alive, rtt);
+        if (ok) {
+            uint32_t rtt = (uint32_t)(now_us() - pc->start_us);
+            g_net_alive = 1;
+            if (g_net_rtt_us == 0 || rtt < g_net_rtt_us)
+                g_net_rtt_us = rtt;
         }
+        g_net_pending--;
+        if (g_net_pending == 0)
+            handle_probe_result(g_net_alive, g_net_rtt_us);
     }
     free(pc);
 }
@@ -494,6 +659,7 @@ static void spawn_probe(const char *host, int is_device)
     if (!pc) return;
 
     pc->is_device = is_device;
+    pc->start_us  = now_us();       /* per-child start, before fork */
     pc->proc.cb   = probe_child_cb;
     pc->proc.pid  = fork();
 
@@ -512,9 +678,9 @@ static void spawn_probe(const char *host, int is_device)
 
 static void start_probe(void)
 {
-    g_net_pending  = 0;
-    g_net_alive    = 0;
-    g_net_start_us = now_us();
+    g_net_pending = 0;
+    g_net_alive   = 0;
+    g_net_rtt_us  = 0;
 
     for (int i = 0; g_probe_hosts[i] != NULL && i < MAX_PROBES; i++)
         spawn_probe(g_probe_hosts[i], 0);
@@ -529,9 +695,9 @@ static void start_probe(void)
 
 static void start_device_probe(void)
 {
-    g_dev_pending  = 0;
-    g_dev_alive    = 0;
-    g_dev_start_us = now_us();
+    g_dev_pending = 0;
+    g_dev_alive   = 0;
+    g_dev_rtt_us  = 0;
 
     if (g_gaming_ip[0] == '\0')
         return;
@@ -559,11 +725,16 @@ static void handle_probe_result(int alive, uint32_t rtt_us)
         history_push(0, 0);
 
         if (g_fail_count >= cfg_threshold) {
-            recover_wan();
-            g_recovery_count++;
-            g_last_recovery_ts = (uint32_t)time(NULL);
+            /* FIX: only count/timestamp when recovery actually started.
+             * recover_wan() is now async and returns -1 if busy. */
+            if (recover_wan() == 0) {
+                g_recovery_count++;
+                g_last_recovery_ts = (uint32_t)time(NULL);
+                uloop_timeout_set(&g_qos_timer, QOS_REAPPLY_DELAY_MS);
+            } else {
+                MY_LOG(LOG_INFO, "Recovery already running, not counted");
+            }
             g_fail_count = 0;
-            uloop_timeout_set(&g_qos_timer, QOS_REAPPLY_DELAY_MS);
         }
     }
     uloop_timeout_set(&g_check_timer, cfg_interval * 1000);
@@ -589,7 +760,11 @@ static void check_timer_cb(struct uloop_timeout *t)
 static void qos_timer_cb(struct uloop_timeout *t)
 {
     (void)t;
-    reapply_game_qos();
+    int rc = reapply_game_qos();
+    if (rc != 0)
+        MY_LOG(LOG_WARNING, "Post-recovery QoS reapply failed (rc=%d)", rc);
+    else
+        MY_LOG(LOG_INFO, "Post-recovery QoS reapply OK");
 }
 
 /* ============================================================
@@ -623,6 +798,7 @@ static int ubus_status_cb(struct ubus_context *ctx, struct ubus_object *obj,
     blobmsg_add_u32(&g_bbuf, "uptime",         (uint32_t)time(NULL) - g_start_time);
     blobmsg_add_u32(&g_bbuf, "recovery_count", g_recovery_count);
     blobmsg_add_u32(&g_bbuf, "last_recovery",  g_last_recovery_ts);
+    blobmsg_add_u32(&g_bbuf, "recovery_state", (uint32_t)g_recovery_state);
     blobmsg_add_string(&g_bbuf, "gaming_ip",   g_gaming_ip);
 
     bbuf_add_history(&g_bbuf, "history",
@@ -640,13 +816,19 @@ static int ubus_force_recovery_cb(struct ubus_context *ctx, struct ubus_object *
 {
     (void)obj; (void)method; (void)msg;
     MY_LOG(LOG_NOTICE, "Manual recovery triggered via ubus");
-    recover_wan();
-    g_recovery_count++;
-    g_last_recovery_ts = (uint32_t)time(NULL);
-    uloop_timeout_set(&g_qos_timer, QOS_REAPPLY_DELAY_MS);
+
+    /* FIX: async — recover_wan() returns immediately. If already busy,
+     * report {ok:0, busy:1} instead of pretending to start again. */
+    int started = (recover_wan() == 0);
+    if (started) {
+        g_recovery_count++;
+        g_last_recovery_ts = (uint32_t)time(NULL);
+        uloop_timeout_set(&g_qos_timer, QOS_REAPPLY_DELAY_MS);
+    }
 
     blob_buf_init(&g_bbuf, 0);
-    blobmsg_add_u8 (&g_bbuf, "ok", 1);
+    blobmsg_add_u8 (&g_bbuf, "ok",   started ? 1 : 0);
+    blobmsg_add_u8 (&g_bbuf, "busy", started ? 0 : 1);
     blobmsg_add_u32(&g_bbuf, "recovery_count", g_recovery_count);
     ubus_send_reply(ctx, req, g_bbuf.head);
     return 0;
@@ -658,10 +840,16 @@ static int ubus_qos_reapply_cb(struct ubus_context *ctx, struct ubus_object *obj
 {
     (void)obj; (void)method; (void)msg;
     MY_LOG(LOG_NOTICE, "QoS reapply triggered via ubus");
-    reapply_game_qos();
+
+    /* FIX: propagate real exit status of `apply_qos` shell command.
+     * rc==0 → ok:1. Anything else → ok:0 with rc field for diagnostics.
+     * NOTE: shell apply_qos() must return non-zero on tc/nft failure,
+     * otherwise rc is always 0 even when shaping failed. See shell patch. */
+    int rc = reapply_game_qos();
 
     blob_buf_init(&g_bbuf, 0);
-    blobmsg_add_u8(&g_bbuf, "ok", 1);
+    blobmsg_add_u8 (&g_bbuf, "ok", rc == 0 ? 1 : 0);
+    blobmsg_add_u32(&g_bbuf, "rc", (uint32_t)(rc & 0xff));
     ubus_send_reply(ctx, req, g_bbuf.head);
     return 0;
 }
@@ -730,6 +918,7 @@ int main(int argc, char **argv)
     g_start_time = (uint32_t)time(NULL);
     uloop_init();
     history_load();
+    recovery_reset();
 
     g_ubus_ctx = ubus_connect(NULL);
     if (!g_ubus_ctx) {
@@ -742,8 +931,9 @@ int main(int argc, char **argv)
             MY_LOG(LOG_INFO, "ubus object 'myhelper' registered");
     }
 
-    g_check_timer.cb = check_timer_cb;
-    g_qos_timer.cb   = qos_timer_cb;
+    g_check_timer.cb          = check_timer_cb;
+    g_qos_timer.cb            = qos_timer_cb;
+    g_recovery_delay_timer.cb = recovery_delay_cb;
 
     uloop_timeout_set(&g_check_timer, 1000);
     uloop_run();
@@ -753,6 +943,7 @@ int main(int argc, char **argv)
 
     uloop_timeout_cancel(&g_check_timer);
     uloop_timeout_cancel(&g_qos_timer);
+    uloop_timeout_cancel(&g_recovery_delay_timer);
     if (g_ubus_ctx) {
         ubus_remove_object(g_ubus_ctx, &myhelper_obj);
         ubus_free(g_ubus_ctx);
@@ -762,4 +953,3 @@ int main(int argc, char **argv)
     closelog();
     return 0;
 }
-         
