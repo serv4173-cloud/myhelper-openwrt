@@ -4,8 +4,8 @@
 # Supports CAKE (4 presets) and HFSC-based game_boost preset.
 #
 # apply_qos() returns 0 on full success, non-zero if any tc/nft/ip command
-# that SHOULD succeed failed. The C daemon (reapply_game_qos) propagates
-# this rc to the "qos_reapply" ubus method ({ok, rc}).
+# that SHOULD succeed failed. The C daemon propagates this rc to the
+# "qos_reapply" ubus method ({ok, rc}).
 #
 
 START=95
@@ -25,6 +25,8 @@ EXTRA_HELP="        apply_qos   Re-apply gaming QoS rules (nft + tc)
 # procd service lifecycle
 # ---------------------------------------------------------------------------
 start_service() {
+    migrate_settings
+
     config_load myhelper
     config_get watchdog_enabled watchdog enabled 1
 
@@ -63,6 +65,33 @@ reload_service() {
 
 service_triggers() {
     procd_add_reload_trigger "myhelper"
+}
+
+# ---------------------------------------------------------------------------
+# UCI schema migration: settings.enabled -> settings.game_boost_enabled
+#
+# "settings.enabled" historically meant Game Boost, but it collided with
+# "watchdog.enabled" (different concern) and confused readers. The new
+# name is explicit. Migration is idempotent.
+# ---------------------------------------------------------------------------
+migrate_settings() {
+    local old_val new_val
+    old_val=$(uci -q get myhelper.settings.enabled)
+    new_val=$(uci -q get myhelper.settings.game_boost_enabled)
+
+    if [ -n "$old_val" ] && [ -z "$new_val" ]; then
+        uci set myhelper.settings.game_boost_enabled="$old_val"
+        uci -q delete myhelper.settings.enabled
+        uci commit myhelper
+        logger -t myhelper-watchdog \
+            "migrated settings.enabled=$old_val -> settings.game_boost_enabled"
+    elif [ -n "$old_val" ] && [ -n "$new_val" ]; then
+        uci -q delete myhelper.settings.enabled
+        uci commit myhelper
+        logger -t myhelper-watchdog \
+            "removed duplicate settings.enabled (kept game_boost_enabled=$new_val)"
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -151,11 +180,7 @@ cleanup_qos() {
 }
 
 # ---------------------------------------------------------------------------
-# BBR congestion control
-#
-# Verifies that the kernel actually switched to BBR. Returns 0 on success
-# (or if already active), 1 on modprobe/sysctl failure. Caller (start_service)
-# ignores the return value — BBR failure must not prevent QoS from applying.
+# BBR congestion control (verified)
 # ---------------------------------------------------------------------------
 apply_bbr() {
     config_load myhelper
@@ -167,7 +192,6 @@ apply_bbr() {
         return 0
     fi
 
-    # Already on BBR? Don't spam modprobe/sysctl on every apply_qos.
     local current
     current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     if [ "$current" = "bbr" ]; then
@@ -180,14 +204,10 @@ apply_bbr() {
             "BBR: modprobe tcp_bbr failed (module not in kernel build?)"
         return 1
     fi
-
     if ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
         logger -t myhelper-watchdog "BBR: sysctl write failed"
         return 1
     fi
-
-    # Read-back: sysctl can succeed on a stale value if the module loaded
-    # but didn't register "bbr" as a selectable algorithm. Trust nothing.
     current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     if [ "$current" != "bbr" ]; then
         logger -t myhelper-watchdog \
@@ -205,22 +225,14 @@ apply_bbr() {
 # ---------------------------------------------------------------------------
 cake_preset_flags() {
     case "$1" in
-        balanced)
-            echo "diffserv4 triple-isolate nat wash ack-filter"
-            ;;
-        low_latency)
-            echo "diffserv8 dual-srchost nat ack-filter"
-            ;;
-        max_throughput)
-            echo "besteffort triple-isolate nat wash"
-            ;;
+        balanced)       echo "diffserv4 triple-isolate nat wash ack-filter" ;;
+        low_latency)    echo "diffserv8 dual-srchost nat ack-filter" ;;
+        max_throughput) echo "besteffort triple-isolate nat wash" ;;
         custom)
             config_get custom_flags settings custom_cake_flags ""
             echo "$custom_flags"
             ;;
-        *)
-            echo "diffserv4 triple-isolate nat wash ack-filter"
-            ;;
+        *) echo "diffserv4 triple-isolate nat wash ack-filter" ;;
     esac
 }
 
@@ -248,13 +260,11 @@ apply_hfsc_game_boost() {
         return 1
     }
 
-    # Convert from "20mbit" UCI value to plain kbit
     case "$total_bw" in
         *mbit) total_bw=$(echo "$total_bw" | sed 's/mbit//'); total_bw=$((total_bw * 1000)) ;;
         *kbit) total_bw=$(echo "$total_bw" | sed 's/kbit//') ;;
     esac
 
-    # Validate numerics — HFSC rate strings with garbage break tc silently.
     case "$total_bw" in
         ''|*[!0-9]*)
             logger -t myhelper-watchdog \
@@ -262,18 +272,12 @@ apply_hfsc_game_boost() {
             return 1
             ;;
     esac
-
     case "$game_bw" in
         ''|*[!0-9]*)
-            logger -t myhelper-watchdog \
-                "HFSC: invalid game_bw='$game_bw', using 0"
+            logger -t myhelper-watchdog "HFSC: invalid game_bw='$game_bw', using 0"
             game_bw=0
             ;;
     esac
-
-    # Clamp: game class cannot exceed the link's total bandwidth.
-    # Without this, an oversized guarantee starves class 1:30 and makes
-    # the whole scheme look "working" while silently crippling bulk.
     if [ "$game_bw" -gt "$total_bw" ]; then
         logger -t myhelper-watchdog \
             "HFSC: game_bw (${game_bw}kbit) > total_bw (${total_bw}kbit), clamping"
@@ -292,24 +296,20 @@ apply_hfsc_game_boost() {
         logger -t myhelper-watchdog "HFSC: root qdisc add failed"
         return 1
     fi
-
     if ! tc class add dev "$dev" parent 1: classid 1:1 hfsc \
         sc rate "${game_bw}kbit" ul rate "${game_bw}kbit"; then
         logger -t myhelper-watchdog "HFSC: class 1:1 (game) add failed"
         err=1
     fi
-
     if ! tc class add dev "$dev" parent 1: classid 1:30 hfsc \
         sc rate "${total_bw}kbit" ul rate "${total_bw}kbit"; then
         logger -t myhelper-watchdog "HFSC: class 1:30 (bulk) add failed"
         err=1
     fi
-
     if ! tc qdisc add dev "$dev" parent 1:1 handle 10: pfifo limit "$pfifo_limit"; then
         logger -t myhelper-watchdog "HFSC: pfifo qdisc add failed"
         err=1
     fi
-
     # shellcheck disable=SC2086
     if ! tc qdisc add dev "$dev" parent 1:30 handle 20: cake \
         bandwidth "${total_bw}kbit" \
@@ -332,7 +332,11 @@ apply_hfsc_game_boost() {
 # ---------------------------------------------------------------------------
 apply_qos() {
     config_load myhelper
-    config_get enabled    settings enabled             0
+    # Read new key first, fall back to legacy `enabled` for pre-migration state.
+    config_get enabled settings game_boost_enabled ""
+    if [ -z "$enabled" ]; then
+        config_get enabled settings enabled 0
+    fi
     config_get ports      settings ports               ""
     config_get wan_if     settings wan_iface           "wan"
     config_get bw_up      settings bandwidth_upload    "0"
@@ -350,21 +354,18 @@ apply_qos() {
         return 0
     fi
 
-    # modified by handle_target_mac() via dynamic scoping (ash/POSIX sh)
     local err=0
 
     cake_flags=$(cake_preset_flags "$qos_preset")
     logger -t myhelper-watchdog \
         "applying game_boost preset=$qos_preset ports=[$ports]"
 
-    # ----- 1. nftables: DSCP + meta priority (HFSC class 1:1) -------------
     nft delete table inet "$NFT_TABLE" 2>/dev/null
 
     if ! nft add table inet "$NFT_TABLE"; then
         logger -t myhelper-watchdog "CRITICAL: nft add table failed"
         return 1
     fi
-
     if ! nft add chain inet "$NFT_TABLE" mark_out \
         '{ type filter hook postrouting priority mangle ; policy accept ; }'; then
         logger -t myhelper-watchdog "CRITICAL: nft add chain failed"
@@ -397,7 +398,6 @@ apply_qos() {
                 logger -t myhelper-watchdog "nft: v4 dst dscp failed for $mac"
                 err=1
             fi
-
             if [ "$SET_PRIO" = "1" ]; then
                 if ! nft add rule inet "$NFT_TABLE" mark_out \
                     ip saddr "$ip" meta priority set 1:1 \
@@ -412,7 +412,6 @@ apply_qos() {
                     err=1
                 fi
             fi
-
             logger -t myhelper-watchdog "MAC $mac -> IPv4 $ip"
         else
             logger -t myhelper-watchdog "MAC $mac: no IPv4 lease"
@@ -433,7 +432,6 @@ apply_qos() {
                 logger -t myhelper-watchdog "nft: v6 dst dscp failed for $mac"
                 err=1
             fi
-
             if [ "$SET_PRIO" = "1" ]; then
                 if ! nft add rule inet "$NFT_TABLE" mark_out \
                     ip6 saddr "$ip6" meta priority set 1:1 \
@@ -448,7 +446,6 @@ apply_qos() {
                     err=1
                 fi
             fi
-
             logger -t myhelper-watchdog "MAC $mac -> IPv6 $ip6"
         fi
     }
@@ -465,33 +462,27 @@ apply_qos() {
         if ! nft add rule inet "$NFT_TABLE" mark_out \
             tcp dport "{ $portset }" ip dscp set cs6 \
             comment '"myhelper: game tcp ports v4"'; then
-            logger -t myhelper-watchdog "nft: tcp v4 ports failed"
-            err=1
+            logger -t myhelper-watchdog "nft: tcp v4 ports failed"; err=1
         fi
         if ! nft add rule inet "$NFT_TABLE" mark_out \
             udp dport "{ $portset }" ip dscp set cs6 \
             comment '"myhelper: game udp ports v4"'; then
-            logger -t myhelper-watchdog "nft: udp v4 ports failed"
-            err=1
+            logger -t myhelper-watchdog "nft: udp v4 ports failed"; err=1
         fi
         if ! nft add rule inet "$NFT_TABLE" mark_out \
             tcp dport "{ $portset }" ip6 dscp set cs6 \
             comment '"myhelper: game tcp ports v6"'; then
-            logger -t myhelper-watchdog "nft: tcp v6 ports failed"
-            err=1
+            logger -t myhelper-watchdog "nft: tcp v6 ports failed"; err=1
         fi
         if ! nft add rule inet "$NFT_TABLE" mark_out \
             udp dport "{ $portset }" ip6 dscp set cs6 \
             comment '"myhelper: game udp ports v6"'; then
-            logger -t myhelper-watchdog "nft: udp v6 ports failed"
-            err=1
+            logger -t myhelper-watchdog "nft: udp v6 ports failed"; err=1
         fi
     fi
 
-    # ----- 2. Egress shaping ---------------------------------------------
     if [ "$bw_up" != "0" ] && [ -n "$bw_up" ]; then
         wan_dev=$(resolve_wan_dev "$wan_if")
-
         if [ "$qos_preset" = "game_boost" ]; then
             if ! apply_hfsc_game_boost "$wan_dev" "$bw_up" "$game_bw" \
                                        "$pfifo_lim" "$linklayer" "$overhead"; then
@@ -502,20 +493,17 @@ apply_qos() {
             cake_ll_suffix=$(cake_linklayer_suffix "$linklayer" "$overhead")
             logger -t myhelper-watchdog \
                 "cake egress dev=$wan_dev rate=$bw_up preset=$qos_preset"
-
             tc qdisc del dev "$wan_dev" root 2>/dev/null
             # shellcheck disable=SC2086
             if ! tc qdisc add dev "$wan_dev" root cake \
                 bandwidth "$bw_up" \
                 $cake_flags $cake_ll_suffix \
                 memlimit 32mb ; then
-                logger -t myhelper-watchdog "cake egress FAILED"
-                err=1
+                logger -t myhelper-watchdog "cake egress FAILED"; err=1
             fi
         fi
     fi
 
-    # ----- 3. Ingress shaping via IFB (always CAKE) ----------------------
     if [ "$bw_down" != "0" ] && [ -n "$bw_down" ]; then
         wan_dev=$(resolve_wan_dev "$wan_if")
         cake_ll_suffix=$(cake_linklayer_suffix "$linklayer" "$overhead")
@@ -523,24 +511,20 @@ apply_qos() {
         modprobe ifb 2>/dev/null
         ip link del "$IFB_DEV" 2>/dev/null
         if ! ip link add "$IFB_DEV" type ifb 2>/dev/null; then
-            logger -t myhelper-watchdog "ingress: ip link add ifb failed"
-            err=1
+            logger -t myhelper-watchdog "ingress: ip link add ifb failed"; err=1
         fi
         if ! ip link set "$IFB_DEV" up; then
-            logger -t myhelper-watchdog "ingress: ip link set up failed"
-            err=1
+            logger -t myhelper-watchdog "ingress: ip link set up failed"; err=1
         fi
 
         tc qdisc del dev "$wan_dev" ingress 2>/dev/null
         if ! tc qdisc add dev "$wan_dev" handle ffff: ingress; then
-            logger -t myhelper-watchdog "ingress: qdisc ingress add failed"
-            err=1
+            logger -t myhelper-watchdog "ingress: qdisc ingress add failed"; err=1
         fi
         if ! tc filter add dev "$wan_dev" parent ffff: protocol all u32 \
             match u32 0 0 \
             action mirred egress redirect dev "$IFB_DEV"; then
-            logger -t myhelper-watchdog "ingress: mirred filter add failed"
-            err=1
+            logger -t myhelper-watchdog "ingress: mirred filter add failed"; err=1
         fi
 
         tc qdisc del dev "$IFB_DEV" root 2>/dev/null
@@ -549,8 +533,7 @@ apply_qos() {
             bandwidth "$bw_down" \
             $cake_flags $cake_ll_suffix \
             memlimit 64mb ; then
-            logger -t myhelper-watchdog "cake ingress FAILED"
-            err=1
+            logger -t myhelper-watchdog "cake ingress FAILED"; err=1
         fi
 
         logger -t myhelper-watchdog \
@@ -569,6 +552,14 @@ apply_qos() {
 # Speedtest (writes to myhelper.settings.*)
 # ---------------------------------------------------------------------------
 speedtest() {
+    # Refuse to run if another speedtest-netperf is already active (e.g. a
+    # previous run orphaned by a daemon restart).
+    if pgrep -f "speedtest-netperf" >/dev/null 2>&1; then
+        logger -t myhelper-watchdog \
+            "speedtest already running (pgrep found speedtest-netperf)"
+        return 1
+    fi
+
     logger -t myhelper-watchdog "starting speedtest..."
 
     if ! command -v speedtest-netperf >/dev/null 2>&1; then
@@ -610,6 +601,5 @@ speedtest() {
 
     logger -t myhelper-watchdog \
         "speedtest done: down=${DL}Mbit up=${UL}Mbit"
-
     echo "DOWN=${DL}Mbit UP=${UL}Mbit"
 }
