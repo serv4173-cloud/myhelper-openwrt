@@ -95,6 +95,10 @@ static struct ping_sample g_history_device[HISTORY_SIZE];
 static int g_history_device_idx   = 0;
 static int g_history_device_count = 0;
 
+/* Shared flush counter: increments on BOTH internet and device samples.
+ * Flushes history file every HISTORY_FLUSH_EVERY combined samples.
+ * When device probe is disabled (empty gaming_ip), behaves exactly as
+ * before: flush every 10 internet samples. */
 static int g_samples_since_flush  = 0;
 
 /* ---------------- Probe targets ---------------- */
@@ -330,12 +334,23 @@ static void history_push(int ok, uint32_t rtt_us)
     }
 }
 
+/* FIX: also drive the flush counter from device samples, so
+ * history_device is persisted every ~10 samples regardless of
+ * whether internet samples happen to be due. Uses the shared
+ * counter — no double-flush in a single tick, because the
+ * increment-before-check pattern guarantees at most one flush
+ * per push. */
 static void history_push_device(int ok, uint32_t rtt_us)
 {
     g_history_device[g_history_device_idx].ok     = (uint8_t)ok;
     g_history_device[g_history_device_idx].rtt_us = rtt_us;
     g_history_device_idx = (g_history_device_idx + 1) % HISTORY_SIZE;
     if (g_history_device_count < HISTORY_SIZE) g_history_device_count++;
+
+    if (++g_samples_since_flush >= HISTORY_FLUSH_EVERY) {
+        g_samples_since_flush = 0;
+        history_save();
+    }
 }
 
 /* ============================================================
@@ -747,3 +762,4 @@ int main(int argc, char **argv)
     closelog();
     return 0;
 }
+         
