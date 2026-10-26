@@ -60,6 +60,9 @@ define Package/myhelper/install
     $(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/etc/uci-defaults/99-myhelper-boot-success \
 		$(1)/etc/uci-defaults/99-myhelper-boot-success
+    # --- Установка библиотеки Chart.js ---
+    $(INSTALL_DATA) ./files/www/luci-static/resources/view/myhelper/chart.umd.min.js \
+        $(1)/www/luci-static/resources/view/myhelper/chart.umd.min.js
 endef
 
 $(eval $(call BuildPackage,myhelper))
