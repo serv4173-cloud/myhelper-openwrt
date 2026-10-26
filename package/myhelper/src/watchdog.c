@@ -6,13 +6,15 @@
  *   - Internet health (1.1.1.1 / 8.8.8.8) -> g_history
  *   - Gaming device health (from /tmp/myhelper_gaming_ip) -> g_history_device
  *
- * RTT for internet probes is the minimum among successful children in a
- * round, not "time until last child exits" (previous behaviour, which
- * reported 3000 ms whenever one host timed out and another replied fast).
+ * RTT is measured inside the child with clock_gettime() around the
+ * sendto/recvfrom pair and delivered to the parent through a pipe.
+ * This avoids fork/exec/scheduler jitter in the reported rtt_us.
+ * The round's rtt_us is the minimum among successful children, so a
+ * single host timing out does not inflate the reported WAN ping.
  *
- * WAN recovery is fully async: ubus down -> 2s uloop_timeout -> ubus up
- * -> ifup fallback. The daemon never blocks on sleep(); ubus handlers
- * (including "status" from LuCI JS) keep working during recovery.
+ * WAN recovery is fully async via uloop_process + uloop_timeout; the
+ * daemon never blocks on sleep(), so "status" ubus calls keep working
+ * during recovery.
  */
 
 #include <stdio.h>
@@ -116,13 +118,19 @@ static const char *g_probe_hosts[MAX_PROBES] = { "1.1.1.1", "8.8.8.8", NULL };
 static char g_gaming_ip[INET_ADDRSTRLEN] = "";
 
 /* ---------------- Probe orchestration state ----------------
- * RTT is tracked per-child (each child has its own start_us), then the
- * minimum among SUCCESSFUL children becomes the round's rtt_us.
+ * Result of a ping child is delivered through a pipe so we get precise
+ * RTT measured inside the child (around sendto/recvfrom), not fork+exec
+ * overhead. see ping_host() and spawn_probe().
  */
+struct probe_result {
+    uint8_t  ok;
+    uint32_t rtt_us;
+};
+
 struct probe_child {
     struct uloop_process proc;
     int                  is_device;
-    uint64_t             start_us;   /* set right before fork() */
+    int                  read_fd;   /* read end of pipe from child */
 };
 
 static int      g_net_pending   = 0;
@@ -361,11 +369,6 @@ static void history_push(int ok, uint32_t rtt_us)
     }
 }
 
-/* FIX (flush): also drive the flush counter from device samples, so
- * history_device is persisted every ~10 samples regardless of whether
- * internet samples happen to be due. Shared counter — no double-flush
- * in a single tick, because increment-before-check guarantees at most
- * one flush per push. */
 static void history_push_device(int ok, uint32_t rtt_us)
 {
     g_history_device[g_history_device_idx].ok     = (uint8_t)ok;
@@ -393,8 +396,15 @@ static unsigned short icmp_checksum(const void *buf, int len)
     return (unsigned short)~sum;
 }
 
-static int ping_host(const char *host, int timeout_sec)
+/* Send one ICMP echo and wait for a reply.
+ * Returns 1 on success, 0 on failure.
+ * On success, *rtt_us_out receives the measured round-trip in microseconds,
+ * timed between sendto() and recvfrom() — i.e. excluding socket setup,
+ * getaddrinfo, fork/exec and everything else. */
+static int ping_host(const char *host, int timeout_sec, uint32_t *rtt_us_out)
 {
+    if (rtt_us_out) *rtt_us_out = 0;
+
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_INET;
@@ -418,14 +428,18 @@ static int ping_host(const char *host, int timeout_sec)
 
     struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
     int ok = 0;
+    uint64_t t0 = now_us();
     if (sendto(sock, pkt, sizeof(pkt), 0,
                (struct sockaddr *)addr, sizeof(*addr)) > 0) {
         unsigned char reply[1024];
         struct sockaddr_in from;
         socklen_t fromlen = sizeof(from);
         if (recvfrom(sock, reply, sizeof(reply), 0,
-                     (struct sockaddr *)&from, &fromlen) > 0)
+                     (struct sockaddr *)&from, &fromlen) > 0) {
+            uint64_t t1 = now_us();
             ok = 1;
+            if (rtt_us_out) *rtt_us_out = (uint32_t)(t1 - t0);
+        }
     }
     close(sock);
     freeaddrinfo(res);
@@ -459,10 +473,6 @@ static pid_t spawn_command(const char *path, char *const argv[])
  *   UP --child exit ok--> IDLE
  *   UP --child exit err--> IFUP (fork ifup)
  *   IFUP --child exit--> IDLE
- *
- * Any step's fork failure falls through to the next step, so we never
- * get stuck. The whole sequence takes ~2.2s wall time but uloop stays
- * responsive throughout.
  * ============================================================ */
 static void recovery_reset(void)
 {
@@ -624,14 +634,29 @@ static int reapply_game_qos(void)
  * ============================================================ */
 static void probe_child_cb(struct uloop_process *p, int ret)
 {
+    (void)ret;
     struct probe_child *pc = container_of(p, struct probe_child, proc);
-    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
 
-    /* FIX (rtt): per-child elapsed time, not "time until last child exits".
-     * Only successful children contribute; keep the minimum. */
+    /* Child exited; its write end is closed, so read() returns either
+     * the full struct or 0 (EOF, child died without writing). Neither
+     * blocks because parent's write end was closed right after fork(). */
+    struct probe_result res = { 0, 0 };
+    if (pc->read_fd >= 0) {
+        ssize_t n = read(pc->read_fd, &res, sizeof(res));
+        close(pc->read_fd);
+        pc->read_fd = -1;
+        if (n != (ssize_t)sizeof(res)) {
+            /* child died before writing (SIGKILL, OOM, bug) — treat as fail */
+            res.ok     = 0;
+            res.rtt_us = 0;
+        }
+    }
+
+    int ok         = res.ok ? 1 : 0;
+    uint32_t rtt   = res.rtt_us;
+
     if (pc->is_device) {
         if (ok) {
-            uint32_t rtt = (uint32_t)(now_us() - pc->start_us);
             g_dev_alive = 1;
             if (g_dev_rtt_us == 0 || rtt < g_dev_rtt_us)
                 g_dev_rtt_us = rtt;
@@ -641,7 +666,6 @@ static void probe_child_cb(struct uloop_process *p, int ret)
             handle_device_probe_result(g_dev_alive, g_dev_rtt_us);
     } else {
         if (ok) {
-            uint32_t rtt = (uint32_t)(now_us() - pc->start_us);
             g_net_alive = 1;
             if (g_net_rtt_us == 0 || rtt < g_net_rtt_us)
                 g_net_rtt_us = rtt;
@@ -658,17 +682,42 @@ static void spawn_probe(const char *host, int is_device)
     struct probe_child *pc = calloc(1, sizeof(*pc));
     if (!pc) return;
 
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        MY_LOG(LOG_ERR, "spawn_probe: pipe() failed: %s", strerror(errno));
+        free(pc);
+        return;
+    }
+
     pc->is_device = is_device;
-    pc->start_us  = now_us();       /* per-child start, before fork */
+    pc->read_fd   = pipefd[0];
     pc->proc.cb   = probe_child_cb;
     pc->proc.pid  = fork();
 
     if (pc->proc.pid == 0) {
+        /* child */
+        close(pipefd[0]);                    /* child only writes */
         freopen("/dev/null", "w", stdout);
         freopen("/dev/null", "w", stderr);
-        _exit(ping_host(host, PING_TIMEOUT_SEC) ? 0 : 1);
+
+        struct probe_result res = { 0, 0 };
+        res.ok = ping_host(host, PING_TIMEOUT_SEC, &res.rtt_us) ? 1 : 0;
+
+        /* small struct (< PIPE_BUF) → atomic write; ignore partial */
+        (void)write(pipefd[1], &res, sizeof(res));
+        /* _exit closes pipefd[1] automatically */
+        _exit(res.ok ? 0 : 1);
     }
-    if (pc->proc.pid < 0) { free(pc); return; }
+
+    /* parent */
+    close(pipefd[1]);                        /* parent only reads; must close write end */
+
+    if (pc->proc.pid < 0) {
+        MY_LOG(LOG_ERR, "spawn_probe: fork() failed: %s", strerror(errno));
+        close(pipefd[0]);
+        free(pc);
+        return;
+    }
 
     if (is_device) g_dev_pending++;
     else           g_net_pending++;
@@ -725,8 +774,6 @@ static void handle_probe_result(int alive, uint32_t rtt_us)
         history_push(0, 0);
 
         if (g_fail_count >= cfg_threshold) {
-            /* FIX: only count/timestamp when recovery actually started.
-             * recover_wan() is now async and returns -1 if busy. */
             if (recover_wan() == 0) {
                 g_recovery_count++;
                 g_last_recovery_ts = (uint32_t)time(NULL);
@@ -817,8 +864,6 @@ static int ubus_force_recovery_cb(struct ubus_context *ctx, struct ubus_object *
     (void)obj; (void)method; (void)msg;
     MY_LOG(LOG_NOTICE, "Manual recovery triggered via ubus");
 
-    /* FIX: async — recover_wan() returns immediately. If already busy,
-     * report {ok:0, busy:1} instead of pretending to start again. */
     int started = (recover_wan() == 0);
     if (started) {
         g_recovery_count++;
@@ -841,10 +886,6 @@ static int ubus_qos_reapply_cb(struct ubus_context *ctx, struct ubus_object *obj
     (void)obj; (void)method; (void)msg;
     MY_LOG(LOG_NOTICE, "QoS reapply triggered via ubus");
 
-    /* FIX: propagate real exit status of `apply_qos` shell command.
-     * rc==0 → ok:1. Anything else → ok:0 with rc field for diagnostics.
-     * NOTE: shell apply_qos() must return non-zero on tc/nft failure,
-     * otherwise rc is always 0 even when shaping failed. See shell patch. */
     int rc = reapply_game_qos();
 
     blob_buf_init(&g_bbuf, 0);
