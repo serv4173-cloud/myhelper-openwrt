@@ -458,9 +458,11 @@ speedtest() {
 
     TS=$(date +%s)
 
-    uci set myhelper.game_boost.speedtest_download="$DL_KBIT"
-    uci set myhelper.game_boost.speedtest_upload="$UL_KBIT"
-    uci set myhelper.game_boost.speedtest_timestamp="$TS"
+    # СТАЛО (settings — та же секция, что читает apply_qos и JS)
+    uci set myhelper.settings.speedtest_download="$DL_KBIT"
+    uci set myhelper.settings.speedtest_upload="$UL_KBIT"
+    uci set myhelper.settings.speedtest_timestamp="$TS"
+    uci -q get myhelper.settings >/dev/null || uci set myhelper.settings=settings
     uci commit myhelper
 
     logger -t myhelper-watchdog \
