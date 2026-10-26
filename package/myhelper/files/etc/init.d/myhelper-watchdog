@@ -5,8 +5,7 @@
 #
 # apply_qos() returns 0 on full success, non-zero if any tc/nft/ip command
 # that SHOULD succeed failed. The C daemon (reapply_game_qos) propagates
-# this rc to the "qos_reapply" ubus method ({ok, rc}), so LuCI can show a
-# truthful error instead of pretending everything worked.
+# this rc to the "qos_reapply" ubus method ({ok, rc}).
 #
 
 START=95
@@ -87,7 +86,6 @@ resolve_mac_to_ip() {
     local target_ip="$2"
     target_mac=$(echo "$target_mac" | tr 'A-Z' 'a-z')
 
-    # Method 1: dnsmasq leases (RomikB build uses dnsmasq, not odhcpd)
     if [ -f /tmp/dhcp.leases ]; then
         local ip
         if [ "$target_ip" = "ipv6" ]; then
@@ -105,7 +103,6 @@ resolve_mac_to_ip() {
         fi
     fi
 
-    # Method 2: odhcpd via ubus (fallback)
     local json dev idx m key
     if [ "$target_ip" = "ipv6" ]; then
         json=$(ubus call dhcp ipv6leases 2>/dev/null)
@@ -134,9 +131,6 @@ resolve_mac_to_ip() {
     return 1
 }
 
-# cleanup_qos: idempotent, best-effort. Never returns non-zero — if there
-# is nothing to clean up, that is not a failure. Callers (stop_service,
-# disabled-branch of apply_qos) don't check the result anyway.
 cleanup_qos() {
     nft delete table inet "$NFT_TABLE" 2>/dev/null
 
@@ -158,20 +152,51 @@ cleanup_qos() {
 
 # ---------------------------------------------------------------------------
 # BBR congestion control
+#
+# Verifies that the kernel actually switched to BBR. Returns 0 on success
+# (or if already active), 1 on modprobe/sysctl failure. Caller (start_service)
+# ignores the return value — BBR failure must not prevent QoS from applying.
 # ---------------------------------------------------------------------------
 apply_bbr() {
     config_load myhelper
     config_get bbr_enabled settings bbr_enabled 0
 
-    if [ "$bbr_enabled" = "1" ]; then
-        modprobe tcp_bbr 2>/dev/null
-        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
-        sysctl -w net.core.default_qdisc=cake >/dev/null 2>&1
-        logger -t myhelper-watchdog "BBR enabled"
-    else
+    if [ "$bbr_enabled" != "1" ]; then
         sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
         logger -t myhelper-watchdog "BBR disabled (using cubic)"
+        return 0
     fi
+
+    # Already on BBR? Don't spam modprobe/sysctl on every apply_qos.
+    local current
+    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [ "$current" = "bbr" ]; then
+        logger -t myhelper-watchdog "BBR already active"
+        return 0
+    fi
+
+    if ! modprobe tcp_bbr 2>/dev/null; then
+        logger -t myhelper-watchdog \
+            "BBR: modprobe tcp_bbr failed (module not in kernel build?)"
+        return 1
+    fi
+
+    if ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+        logger -t myhelper-watchdog "BBR: sysctl write failed"
+        return 1
+    fi
+
+    # Read-back: sysctl can succeed on a stale value if the module loaded
+    # but didn't register "bbr" as a selectable algorithm. Trust nothing.
+    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [ "$current" != "bbr" ]; then
+        logger -t myhelper-watchdog \
+            "BBR: kernel did not switch (current=$current)"
+        return 1
+    fi
+
+    sysctl -w net.core.default_qdisc=cake >/dev/null 2>&1
+    logger -t myhelper-watchdog "BBR enabled and verified"
     return 0
 }
 
@@ -199,9 +224,6 @@ cake_preset_flags() {
     esac
 }
 
-# ---------------------------------------------------------------------------
-# Link layer adaptation suffix for CAKE
-# ---------------------------------------------------------------------------
 cake_linklayer_suffix() {
     local ll="$1" oh="$2"
     local s=""
@@ -211,15 +233,11 @@ cake_linklayer_suffix() {
 
 # ---------------------------------------------------------------------------
 # HFSC + pfifo + CAKE (game_boost preset)
-#
-# Returns 0 if the full HFSC tree applied cleanly, non-zero if any tc
-# add/class operation failed. `tc ... del` failures are ignored (expected
-# when no previous qdisc exists).
 # ---------------------------------------------------------------------------
 apply_hfsc_game_boost() {
     local dev="$1"
-    local total_bw="$2"     # kbit total (from bandwidth_upload)
-    local game_bw="$3"      # kbit guaranteed for games
+    local total_bw="$2"
+    local game_bw="$3"
     local pfifo_limit="$4"
     local linklayer="$5"
     local overhead="$6"
@@ -230,11 +248,37 @@ apply_hfsc_game_boost() {
         return 1
     }
 
-    # Convert from "20mbit" UCI value to plain number if needed
+    # Convert from "20mbit" UCI value to plain kbit
     case "$total_bw" in
         *mbit) total_bw=$(echo "$total_bw" | sed 's/mbit//'); total_bw=$((total_bw * 1000)) ;;
         *kbit) total_bw=$(echo "$total_bw" | sed 's/kbit//') ;;
     esac
+
+    # Validate numerics — HFSC rate strings with garbage break tc silently.
+    case "$total_bw" in
+        ''|*[!0-9]*)
+            logger -t myhelper-watchdog \
+                "HFSC: invalid total_bw='$total_bw' (expected numeric kbit)"
+            return 1
+            ;;
+    esac
+
+    case "$game_bw" in
+        ''|*[!0-9]*)
+            logger -t myhelper-watchdog \
+                "HFSC: invalid game_bw='$game_bw', using 0"
+            game_bw=0
+            ;;
+    esac
+
+    # Clamp: game class cannot exceed the link's total bandwidth.
+    # Without this, an oversized guarantee starves class 1:30 and makes
+    # the whole scheme look "working" while silently crippling bulk.
+    if [ "$game_bw" -gt "$total_bw" ]; then
+        logger -t myhelper-watchdog \
+            "HFSC: game_bw (${game_bw}kbit) > total_bw (${total_bw}kbit), clamping"
+        game_bw="$total_bw"
+    fi
 
     local cake_ll_suffix
     cake_ll_suffix=$(cake_linklayer_suffix "$linklayer" "$overhead")
@@ -242,7 +286,6 @@ apply_hfsc_game_boost() {
     logger -t myhelper-watchdog \
         "HFSC game_boost: total=${total_bw}kbit game=${game_bw}kbit pfifo=$pfifo_limit"
 
-    # Root qdisc: HFSC. The preceding del is best-effort — no error check.
     tc qdisc del dev "$dev" root 2>/dev/null
 
     if ! tc qdisc add dev "$dev" root handle 1: hfsc default 30; then
@@ -250,27 +293,23 @@ apply_hfsc_game_boost() {
         return 1
     fi
 
-    # Class 1:1 - Game traffic (guaranteed bw)
     if ! tc class add dev "$dev" parent 1: classid 1:1 hfsc \
         sc rate "${game_bw}kbit" ul rate "${game_bw}kbit"; then
         logger -t myhelper-watchdog "HFSC: class 1:1 (game) add failed"
         err=1
     fi
 
-    # Class 1:30 - Everything else
     if ! tc class add dev "$dev" parent 1: classid 1:30 hfsc \
         sc rate "${total_bw}kbit" ul rate "${total_bw}kbit"; then
         logger -t myhelper-watchdog "HFSC: class 1:30 (bulk) add failed"
         err=1
     fi
 
-    # Game class qdisc: pfifo with small limit => low latency
     if ! tc qdisc add dev "$dev" parent 1:1 handle 10: pfifo limit "$pfifo_limit"; then
         logger -t myhelper-watchdog "HFSC: pfifo qdisc add failed"
         err=1
     fi
 
-    # Bulk class qdisc: CAKE
     # shellcheck disable=SC2086
     if ! tc qdisc add dev "$dev" parent 1:30 handle 20: cake \
         bandwidth "${total_bw}kbit" \
@@ -290,10 +329,6 @@ apply_hfsc_game_boost() {
 
 # ---------------------------------------------------------------------------
 # Game Boost: DSCP marking (nft) + CAKE shaping (tc)
-#
-# Returns 0 on full success. Any failure of an add/set operation that was
-# supposed to succeed bumps err=1. Critical bootstrap (nft table/chain)
-# fails early with return 1. All `delete` operations are best-effort.
 # ---------------------------------------------------------------------------
 apply_qos() {
     config_load myhelper
@@ -315,9 +350,7 @@ apply_qos() {
         return 0
     fi
 
-    # local err: modified by handle_target_mac() below via dynamic scoping
-    # (ash/POSIX sh allows inner functions to mutate outer locals when
-    # called from within the outer function's scope).
+    # modified by handle_target_mac() via dynamic scoping (ash/POSIX sh)
     local err=0
 
     cake_flags=$(cake_preset_flags "$qos_preset")
@@ -338,7 +371,6 @@ apply_qos() {
         return 1
     fi
 
-    # Determine if we should set meta priority (only for game_boost preset)
     SET_PRIO=0
     [ "$qos_preset" = "game_boost" ] && SET_PRIO=1
 
@@ -348,7 +380,6 @@ apply_qos() {
         local mac="$1"
         [ -n "$mac" ] || return 0
 
-        # --- IPv4 ---
         local ip
         ip=$(resolve_mac_to_ip "$mac" "ipv4")
         if [ -n "$ip" ]; then
@@ -387,7 +418,6 @@ apply_qos() {
             logger -t myhelper-watchdog "MAC $mac: no IPv4 lease"
         fi
 
-        # --- IPv6 ---
         local ip6
         ip6=$(resolve_mac_to_ip "$mac" "ipv6")
         if [ -n "$ip6" ]; then
@@ -430,7 +460,6 @@ apply_qos() {
         rm -f "$GAMING_IP_FILE"
     fi
 
-    # Port-based marking (v4 + v6)
     if [ -n "$ports" ]; then
         portset=$(echo "$ports" | sed "s/ *, */, /g")
         if ! nft add rule inet "$NFT_TABLE" mark_out \
@@ -464,14 +493,12 @@ apply_qos() {
         wan_dev=$(resolve_wan_dev "$wan_if")
 
         if [ "$qos_preset" = "game_boost" ]; then
-            # HFSC path. If it fails, error is aggregated and reported.
             if ! apply_hfsc_game_boost "$wan_dev" "$bw_up" "$game_bw" \
                                        "$pfifo_lim" "$linklayer" "$overhead"; then
                 logger -t myhelper-watchdog "HFSC game_boost failed (see above)"
                 err=1
             fi
         else
-            # CAKE-only path
             cake_ll_suffix=$(cake_linklayer_suffix "$linklayer" "$overhead")
             logger -t myhelper-watchdog \
                 "cake egress dev=$wan_dev rate=$bw_up preset=$qos_preset"
@@ -539,11 +566,7 @@ apply_qos() {
 }
 
 # ---------------------------------------------------------------------------
-# Speedtest: measure current up/down speed and store in UCI
-#
-# Writes to myhelper.settings.* (canonical). The JS view reads settings.*
-# first, falling back to game_boost.* for legacy installs that ran the
-# old (broken) version of this function.
+# Speedtest (writes to myhelper.settings.*)
 # ---------------------------------------------------------------------------
 speedtest() {
     logger -t myhelper-watchdog "starting speedtest..."
@@ -558,7 +581,6 @@ speedtest() {
         }
     fi
 
-    # 120s hard cap: speedtest-netperf can hang for minutes on a flaky WAN.
     OUT=$(timeout 120 speedtest-netperf -H netperf.bufferbloat.net 2>&1)
 
     DL=$(echo "$OUT" | grep -iE 'download' | grep -oE '[0-9]+\.[0-9]+' | head -1)
@@ -567,7 +589,6 @@ speedtest() {
     [ -z "$DL" ] && DL=0
     [ -z "$UL" ] && UL=0
 
-    # Convert Mbit -> kbit using awk (busybox-compatible)
     DL_KBIT=$(echo "$DL" | awk '{printf "%d", $1 * 1000}')
     UL_KBIT=$(echo "$UL" | awk '{printf "%d", $1 * 1000}')
     [ -z "$DL_KBIT" ] && DL_KBIT=0
@@ -575,7 +596,6 @@ speedtest() {
 
     TS=$(date +%s)
 
-    # Ensure the canonical section exists (idempotent).
     if ! uci -q show myhelper.settings >/dev/null 2>&1; then
         uci set myhelper.settings=settings
     fi
