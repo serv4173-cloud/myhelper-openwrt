@@ -63,6 +63,23 @@ define Package/myhelper/install
     # --- Установка библиотеки Chart.js ---
     $(INSTALL_DATA) ./files/www/luci-static/resources/view/myhelper/chart.umd.min.js \
         $(1)/www/luci-static/resources/view/myhelper/chart.umd.min.js
+    # --- Custom Files (sysauth, fail2ban) ---
+	# 1. Неоновая страница логина
+	$(INSTALL_DIR) $(1)/usr/share/ucode/luci/template/themes/argon
+	$(INSTALL_DATA) ./files/usr/share/ucode/luci/template/themes/argon/sysauth.ut $(1)/usr/share/ucode/luci/template/themes/argon/
+
+	# 2. Скрипт fail2ban
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) ./files/usr/bin/luci-fail2ban.sh $(1)/usr/bin/
+
+	# 3. Init-скрипт fail2ban
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/etc/init.d/luci-fail2ban $(1)/etc/init.d/
+
+	# 4. Автозапуск (симлинк)
+	$(INSTALL_DIR) $(1)/etc/rc.d
+	$(LN) ../init.d/luci-fail2ban $(1)/etc/rc.d/S99luci-fail2ban
+
 endef
 
 $(eval $(call BuildPackage,myhelper))
