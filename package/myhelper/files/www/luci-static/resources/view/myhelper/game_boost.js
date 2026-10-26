@@ -1,913 +1,262 @@
 'use strict';
 'require view';
-'require form';
 'require uci';
 'require rpc';
 'require ui';
 'require dom';
+'require poll';
 
-/* ============================================================
- *  RPC declarations
- * ============================================================ */
+// --- RPC Declarations ---
+var callStatus = rpc.declare({ object: 'myhelper', method: 'status' });
+var callForceRecovery = rpc.declare({ object: 'myhelper', method: 'force_recovery' });
+var callQosReapply = rpc.declare({ object: 'myhelper', method: 'qos_reapply' });
+var callDhcpLeases = rpc.declare({ object: 'dhcp', method: 'ipv4leases' });
+var callIfaceStatus = rpc.declare({ object: 'network.interface.wan', method: 'status' });
 
-var callInit = rpc.declare({
-    object: 'rc', method: 'init',
-    params: [ 'name', 'action' ], expect: { result: false }
-});
-
-var callStatus = rpc.declare({
-    object: 'myhelper', method: 'status'
-});
-
-var callForceRecovery = rpc.declare({
-    object: 'myhelper', method: 'force_recovery'
-});
-
-var callQosReapply = rpc.declare({
-    object: 'myhelper', method: 'qos_reapply'
-});
-
-var callDhcpLeases = rpc.declare({
-    object: 'dhcp', method: 'ipv4leases'
-});
-
-/* ============================================================
- *  Helpers
- * ============================================================ */
-
-var MAC_RE = /^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/;
-
-function normalizeMac(v) {
-    return String(v || '').trim().toLowerCase();
-}
-
-function fmtUptime(sec) {
-    sec = parseInt(sec, 10) || 0;
-    var d = Math.floor(sec / 86400);
-    var h = Math.floor((sec % 86400) / 3600);
-    var m = Math.floor((sec % 3600) / 60);
-    var s = sec % 60;
-    if (d > 0) return '%dd %dh %dm'.format(d, h, m);
-    if (h > 0) return '%dh %dm %ds'.format(h, m, s);
-    return '%dm %ds'.format(m, s);
-}
-
-function fmtTimestamp(ts) {
-    if (!ts) return _('never');
-    try { return new Date(ts * 1000).toLocaleString(); }
-    catch (e) { return String(ts); }
-}
-
-function flattenLeases(raw) {
-    var out = [];
-    if (!raw) return out;
-
-    function push(lease) {
-        if (!lease || !lease.mac) return;
-        out.push({
-            mac:      normalizeMac(lease.mac),
-            ip:       lease.ip || '',
-            hostname: (lease.hostname || '').trim(),
-            online:   lease.valid !== false
-        });
-    }
-
-    if (raw.device && typeof raw.device === 'object') {
-        Object.keys(raw.device).forEach(function (dev) {
-            var l = raw.device[dev] && raw.device[dev].leases;
-            if (Array.isArray(l)) l.forEach(push);
-        });
-    } else if (Array.isArray(raw.leases)) {
-        raw.leases.forEach(push);
-    }
-    return out;
-}
-
-function getTargetMacs() {
-    var cur = uci.get('myhelper', 'settings', 'target_mac') || [];
-    if (typeof cur === 'string') cur = [ cur ];
-    return cur.map(normalizeMac).filter(Boolean);
-}
-
-function ipSortKey(ip) {
-    if (!ip || ip === '-') return 0xffffffff;
-    var p = String(ip).split('.').map(function (x) { return parseInt(x, 10) || 0; });
-    if (p.length !== 4) return 0xfffffffe;
-    return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
-}
-
-/* ============================================================
- *  SVG graph rendering
- * ============================================================ */
-
-var CAKE_PRESETS = [
-    { value: 'balanced',       label: 'Balanced (diffserv4)' },
-    { value: 'low_latency',    label: 'Low Latency (diffserv8 + dual-srchost)' },
-    { value: 'max_throughput', label: 'Max Throughput (besteffort)' },
-    { value: 'game_boost',     label: 'Game Boost (HFSC + pfifo + CAKE)' },
-    { value: 'custom',         label: 'Custom' }
-];
-
-function renderSvgGraph(hist, opts) {
-    opts = opts || {};
-    var W = 600, H = 140, PAD = 12;
-    var w = W - 2 * PAD, h = H - 2 * PAD;
-    var n = hist.length;
-
-    if (n === 0) {
-        return E('div', { 'class': 'cbi-section' }, [
-            E('h3', {}, opts.title || _('Ping History')),
-            E('p', { 'style': 'color: #888' },
-              opts.emptyText || _('No probe history yet.'))
-        ]);
-    }
-
-    var maxRtt = 50;
-    hist.forEach(function (s) {
-        if (s.ok) maxRtt = Math.max(maxRtt, s.rtt_us / 1000);
+// Load Chart.js from our local resource folder
+var loadChartScript = function() {
+    return new Promise(function(resolve) {
+        if (window.Chart) return resolve();
+        var script = document.createElement('script');
+        script.src = L.resource('view/myhelper/chart.umd.min.js');
+        script.onload = resolve;
+        document.head.appendChild(script);
     });
-
-    var barW = Math.max(1, w / n - 1);
-    var children = [
-        E('rect', { x: 0, y: 0, width: W, height: H,
-            fill: 'transparent', stroke: '#888' })
-    ];
-
-    hist.forEach(function (s, i) {
-        var x = PAD + (i / n) * w;
-        var barH, fill;
-        if (!s.ok) { barH = h; fill = '#d9534f'; }
-        else {
-            barH = Math.max(2, (s.rtt_us / 1000 / maxRtt) * h);
-            fill = '#5cb85c';
-        }
-        children.push(E('rect', {
-            x: x, y: PAD + h - barH, width: barW, height: barH, fill: fill
-        }));
-    });
-
-    return E('div', { 'class': 'cbi-section' }, [
-        E('h3', {}, opts.title || _('Ping History')),
-        E('svg', {
-            viewBox: '0 0 %d %d'.format(W, H),
-            width: '100%',
-            height: H,
-            preserveAspectRatio: 'none'
-        }, children),
-        E('div', { 'style': 'font-size: 11px; color: #666; margin-top: 4px' },
-          (opts.subtitle || '') +
-          ' \u2022 ' + _('Last %d probes').format(n) +
-          ' \u2022 ' + _('scale 0..%d ms').format(Math.round(maxRtt)))
-    ]);
-}
-
-/* ============================================================
- *  Main view
- * ============================================================ */
+};
 
 return view.extend({
+    speedChart: null,
+    lastBytes: null,
 
-    _sortKey: 'priority',
-    _sortDir: 'desc',
-
-    /* ---------------------------------------------------------------
-     * Lifecycle
-     * --------------------------------------------------------------- */
-
-    load: function () {
+    load: function() {
         var self = this;
-        self.status  = {};
-        self.devices = [];
-
         return Promise.all([
             uci.load('myhelper'),
-            uci.load('network'),
-            callStatus().then(function (res) { self.status = res || {}; })
-                        .catch(function () { self.status = {}; }),
-            self.fetchDevices()
+            callStatus().then(function(res) { self.status = res || {}; }).catch(function() { self.status = {}; }),
+            callDhcpLeases().then(function(res) { self.leases = res || {}; }).catch(function() { self.leases = {}; })
         ]);
     },
 
-    fetchDevices: function () {
-        var self = this;
-        return callDhcpLeases().then(function (raw) {
-            self.devices = flattenLeases(raw);
-        }).catch(function () {
-            self.devices = [];
-        });
-    },
-
-    pollStatus: function () {
-        var self = this;
-        return Promise.all([
-            callStatus().then(function (res) { self.status = res || {}; })
-                        .catch(function () { self.status = {}; }),
-            self.fetchDevices()
-        ]);
-    }, 
-
-
-
-    // --- NEW: Live Speed calculation ---
-    lastBytes: null, // Переменная для хранения предыдущих значений трафика
-
-    updateLiveSpeed: function () {
-        var self = this;
-        var iface = uci.get('myhelper', 'settings', 'wan_iface') || 'wan';
-
-        // Динамически объявляем RPC-вызов для текущего WAN-интерфейса
-        var callIfaceStatus = rpc.declare({
-            object: 'network.interface.' + iface,
-            method: 'status'
-        });
-
-        return callIfaceStatus().then(function (res) {
-            if (!res || !res.statistics) return;
-
-            var now = Date.now();
-            var rx = res.statistics.rx_bytes;
-            var tx = res.statistics.tx_bytes;
-
-            // При первом запуске просто запоминаем значения
-            if (!self.lastBytes) {
-                self.lastBytes = { rx: rx, tx: tx, time: now };
-                return;
-            }
-
-            var dt = (now - self.lastBytes.time) / 1000; // разница в секундах
-            if (dt > 0) {
-                var rxDiff = rx - self.lastBytes.rx;
-                var txDiff = tx - self.lastBytes.tx;
-
-                // Защита от отрицательных значений (если интерфейс перезагрузился)
-                if (rxDiff < 0) rxDiff = 0;
-                if (txDiff < 0) txDiff = 0;
-
-                // Перевод байт в Мбит/с: (байты * 8) / 1 000 000
-                var rxMbps = ((rxDiff * 8) / 1000000 / dt).toFixed(2);
-                var txMbps = ((txDiff * 8) / 1000000 / dt).toFixed(2);
-
-                // Обновляем значение в таблице
-                if (self.$fields && self.$fields.liveSpeed) {
-                    self.$fields.liveSpeed.firstChild.nodeValue = 
-                        '↓ ' + rxMbps + ' Mb/s / ↑ ' + txMbps + ' Mb/s';
-                }
-            }
-            self.lastBytes = { rx: rx, tx: tx, time: now };
-        }).catch(function (err) {
-            console.error("Live speed error:", err);
-        });
-    },
-
-    /* ---------------------------------------------------------------
-     * Status panel
-     * --------------------------------------------------------------- */
-
-    renderStatusPanel: function () {
+    render: function() {
         var self = this;
         var s = this.status || {};
-        var preset = uci.get('myhelper', 'settings', 'qos_preset') || 'disabled';
-        var bwUp   = uci.get('myhelper', 'settings', 'bandwidth_upload') || '0';
+        
+        // Read UCI values
+        var gbEnabled = uci.get('myhelper', 'settings', 'enabled') === '1';
+        var preset = uci.get('myhelper', 'settings', 'qos_preset') || 'balanced';
         var bwDown = uci.get('myhelper', 'settings', 'bandwidth_download') || '0';
-        var enabled = uci.get('myhelper', 'settings', 'enabled') === '1';
+        var bwUp = uci.get('myhelper', 'settings', 'bandwidth_upload') || '0';
 
-        // Calculate latest latency from history
-        var lastRtt = '---';
+        // Get latest ping
+        var lastPing = '---';
         if (s.history && s.history.length > 0) {
             var last = s.history[s.history.length - 1];
-            if (last.ok) {
-                lastRtt = (last.rtt_us / 1000).toFixed(0) + ' ms';
-            } else {
-                lastRtt = 'timeout';
-            }
+            lastPing = last.ok ? (last.rtt_us / 1000).toFixed(0) + ' ms' : 'timeout';
         }
 
-        this.$fields = {
-            internet: s.internet
-                ? E('span', { 'class': 'label success' }, _('ONLINE'))
-                : E('span', { 'class': 'label warning' }, _('OFFLINE')),
-            preset:   E('span', { 'class': 'label' }, enabled ? preset : _('disabled')),
-            latency:  E('span', { 'class': 'label', 'style': 'background:#5cb85c; color:white' }, lastRtt),
-            limits:   E('span', {}, '↓ ' + bwDown + ' / ↑ ' + bwUp),
-            liveSpeed: E('span', { 'style': 'font-family: monospace; font-size: 14px;' }, '↓ 0.00 Mb/s / ↑ 0.00 Mb/s'),
-            recoveries: E('span', {}, String(s.recovery_count || 0))
-        };
+        // CSS Styles scoped to .myhelper-dashboard
+        var css = E('style', {}, `
+            .myhelper-dashboard {
+                --space-bg: #0b001a;
+                --bg-panel: rgba(14, 16, 24, 0.65);
+                --accent-gold: #f5c451;
+                --accent-red: #ff3333;
+                --accent-blue: #00d2ff;
+                --accent-green: #22c55e;
+                --text-main: #e2e8f0;
+                --text-muted: #94a3b8;
+                background-color: var(--space-bg);
+                background-image: 
+                    radial-gradient(circle at 15% 25%, rgba(168, 85, 247, 0.4) 0%, transparent 40%),
+                    radial-gradient(circle at 85% 75%, rgba(59, 130, 246, 0.35) 0%, transparent 45%),
+                    linear-gradient(135deg, #05050a 0%, #1e0b36 50%, #05050a 100%);
+                color: var(--text-main);
+                padding: 20px;
+                border-radius: 8px;
+                font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            }
+            .myhelper-dashboard .dashboard-grid { display: grid; grid-template-columns: 1fr; gap: 15px; }
+            @media (min-width: 800px) { .myhelper-dashboard .dashboard-grid { grid-template-columns: 1.2fr 1fr; } }
+            .myhelper-dashboard .panel {
+                background: var(--bg-panel); backdrop-filter: blur(16px);
+                border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px;
+                padding: 15px; box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            }
+            .myhelper-dashboard .panel-header {
+                display: flex; align-items: center; gap: 8px; margin-bottom: 15px;
+                font-size: 14px; font-weight: bold; color: var(--accent-gold); text-transform: uppercase;
+            }
+            .myhelper-dashboard .status-row {
+                display: flex; justify-content: space-between; padding: 6px 0;
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+            }
+            .myhelper-dashboard .label-internet { color: #00ffcc; font-weight: bold; }
+            .myhelper-dashboard .label-ping { color: var(--accent-gold); font-weight: bold; }
+            .myhelper-dashboard .badge-online { background: rgba(34, 197, 94, 0.15); color: var(--accent-green); padding: 2px 6px; border-radius: 4px; font-size: 10px; }
+            .myhelper-dashboard .chart-container { height: 100px; width: 100%; background: rgba(0,0,0,0.5); border-radius: 4px; margin-top: 10px; }
+            .myhelper-dashboard .btn {
+                padding: 8px 12px; border-radius: 4px; border: none; font-weight: bold; cursor: pointer; font-size: 11px; text-transform: uppercase;
+            }
+            .myhelper-dashboard .btn-primary { background: var(--accent-red); color: #fff; box-shadow: 0 0 10px rgba(255, 51, 51, 0.4); }
+            .myhelper-dashboard .btn-outline { background: transparent; border: 1px solid var(--accent-blue); color: var(--accent-blue); }
+            .myhelper-dashboard .toggle-switch {
+                position: relative; width: 36px; height: 18px; background: rgba(255,255,255,0.15); border-radius: 18px; cursor: pointer; transition: 0.3s;
+            }
+            .myhelper-dashboard .toggle-switch::after {
+                content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; background: white; border-radius: 50%; transition: 0.3s;
+            }
+            .myhelper-dashboard .toggle-switch.active { background: var(--accent-green); box-shadow: 0 0 10px rgba(34, 197, 94, 0.6); }
+            .myhelper-dashboard .toggle-switch.active::after { transform: translateX(18px); }
+        `);
 
-        // Buttons
-        var btnForce = E('button', {
-            'class': 'cbi-button cbi-button-action',
-            'click': ui.createHandlerFn(this, function () {
-                if (!confirm(_('Trigger WAN recovery now?'))) return;
-                return callForceRecovery().then(function () {
-                    ui.addNotification(null, E('p', _('Recovery triggered.')), 'info');
-                    return self.pollStatus().then(function () { self.refreshPanel(); });
-                });
-            })
-        }, _('Force Recovery'));
-
-        var btnQos = E('button', {
-            'class': 'cbi-button cbi-button-apply',
-            'click': ui.createHandlerFn(this, function () {
-                return callQosReapply().then(function () {
-                    ui.addNotification(null, E('p', _('QoS re-applied.')), 'info');
-                });
-            })
-        }, _('Re-apply QoS'));
-
-        var table = E('table', { 'class': 'table' }, [
-            E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left', 'width': '20%' }, _('Internet')),
-                E('td', { 'class': 'td left' }, this.$fields.internet)
-            ]),
-            E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left' }, _('CAKE Preset')),
-                E('td', { 'class': 'td left' }, this.$fields.preset)
-            ]),
-            E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left' }, _('Current Ping')),
-                E('td', { 'class': 'td left' }, this.$fields.latency)
-            ]),
-            E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left' }, _('Configured Limit')),
-                E('td', { 'class': 'td left' }, this.$fields.limits)
-            ]),
-            E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left' }, _('Live Speed')),
-                E('td', { 'class': 'td left' }, this.$fields.liveSpeed)
-            ]),
-            E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left' }, _('Recoveries')),
-                E('td', { 'class': 'td left' }, this.$fields.recoveries)
-            ]),
-            E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td left' }, _('Actions')),
-                E('td', { 'class': 'td left' }, [ btnForce, ' ', btnQos ])
+        // HTML UI
+        var dashboard = E('div', { 'class': 'myhelper-dashboard' }, [
+            E('div', { 'class': 'dashboard-grid' }, [
+                // LEFT COLUMN
+                E('div', {}, [
+                    E('div', { 'class': 'panel' }, [
+                        E('div', { 'class': 'panel-header' }, 'LIVE STATUS'),
+                        E('div', { 'class': 'status-row' }, [
+                            E('span', { 'class': 'label-internet' }, 'INTERNET'),
+                            E('span', { 'class': 'badge-online' }, s.internet ? 'ONLINE' : 'OFFLINE')
+                        ]),
+                        E('div', { 'class': 'status-row' }, [
+                            E('span', { 'class': 'label-ping' }, 'CURRENT PING'),
+                            E('span', { 'id': 'dash-ping', 'class': 'text-yellow' }, lastPing)
+                        ]),
+                        E('div', { 'class': 'status-row' }, [
+                            E('span', { 'style': 'color: var(--accent-blue);' }, 'LIVE SPEED'),
+                            E('span', {}, [
+                                E('span', { 'id': 'dash-down', 'style': 'color: #00d2ff; font-weight:bold;' }, '↓ 0.00 Mb/s'),
+                                ' / ',
+                                E('span', { 'id': 'dash-up', 'style': 'color: #ff3333; font-weight:bold;' }, '↑ 0.00 Mb/s')
+                            ])
+                        ]),
+                        E('div', { 'class': 'chart-container' }, [
+                            E('canvas', { 'id': 'speedChart' })
+                        ])
+                    ])
+                ]),
+                // RIGHT COLUMN
+                E('div', {}, [
+                    E('div', { 'class': 'panel' }, [
+                        E('div', { 'class': 'panel-header' }, 'GAME BOOST'),
+                        E('div', { 'style': 'font-size: 11px; color: #94a3b8; margin-bottom: 10px;' }, 
+                          'Preset: ' + preset.toUpperCase() + ' | Limits: ↓' + bwDown + ' ↑' + bwUp),
+                        E('div', { 'style': 'display:flex; align-items:center; gap:10px; margin-bottom: 15px;' }, [
+                            E('div', { 
+                                'class': 'toggle-switch ' + (gbEnabled ? 'active' : ''),
+                                'id': 'dash-toggle',
+                                'click': ui.createHandlerFn(this, function(ev) {
+                                    var isActive = ev.target.classList.contains('active');
+                                    ev.target.classList.toggle('active');
+                                    uci.set('myhelper', 'settings', 'enabled', isActive ? '0' : '1');
+                                    uci.save();
+                                    ui.addNotification(null, E('p', _('Game Boost status changed. Click Save & Apply to apply.')), 'info');
+                                })
+                            }),
+                            E('span', { 'style': 'font-size: 11px; font-weight: bold;' }, 'ENABLE GAME BOOST')
+                        ]),
+                        E('div', { 'style': 'display: flex; gap: 10px;' }, [
+                            E('button', {
+                                'class': 'btn btn-primary',
+                                'click': ui.createHandlerFn(this, function() {
+                                    uci.save().then(function() {
+                                        return callQosReapply();
+                                    }).then(function() {
+                                        ui.addNotification(null, E('p', _('Configuration applied.')), 'info');
+                                    });
+                                })
+                            }, 'SAVE & APPLY'),
+                            E('button', {
+                                'class': 'btn btn-outline',
+                                'click': ui.createHandlerFn(this, function() {
+                                    if (confirm(_('Force WAN Recovery?'))) {
+                                        callForceRecovery().then(function() {
+                                            ui.addNotification(null, E('p', _('Recovery triggered.')), 'warning');
+                                        });
+                                    }
+                                })
+                            }, 'FORCE RECOVERY')
+                        ])
+                    ])
+                ])
             ])
         ]);
 
-        return E('div', { 'class': 'cbi-section' }, [
-            E('h3', {}, _('Live Status')),
-            table
-        ]);
-    },
-
-    refreshPanel: function () {
-        var s = this.status || {};
-        if (!this.$fields) return;
-
-        var parent = this.$fields.internet.parentNode;
-        if (parent) {
-            var replacement = s.internet
-                ? E('span', { 'class': 'label success' }, _('ONLINE'))
-                : E('span', { 'class': 'label warning' }, _('OFFLINE'));
-            parent.replaceChild(replacement, this.$fields.internet);
-            this.$fields.internet = replacement;
-        }
-        this.$fields.fail.firstChild.nodeValue =
-            '%d / %d'.format(s.fail_count || 0, s.threshold || 0);
-        this.$fields.uptime.firstChild.nodeValue = fmtUptime(s.uptime);
-        this.$fields.recoveries.firstChild.nodeValue = String(s.recovery_count || 0);
-        this.$fields.lastRecovery.firstChild.nodeValue = fmtTimestamp(s.last_recovery);
-        this.$fields.gamingIp.firstChild.nodeValue = s.gaming_ip || _('not resolved');
-    },
-
-    /* ============================================================
-     *  Devices tab
-     * ============================================================ */
-
-    renderDevicesTable: function () {
-        var self = this;
-        this.$devicesContainer  = E('div', { 'id': 'myhelper-devices' });
-        this.$devicesOnlyToggle = E('input', {
-            type: 'checkbox',
-            'click': function () { self.refreshDevicesTable(); }
-        });
-
-        var toolbar = E('div', { 'style': 'margin-bottom: 8px' }, [
-            E('label', { 'style': 'margin-right: 16px' }, [
-                this.$devicesOnlyToggle, ' ',
-                _('Show only gaming devices')
-            ]),
-            E('button', {
-                'class': 'cbi-button cbi-button-neutral',
-                'click': ui.createHandlerFn(this, function () {
-                    return self.pollStatus().then(function () {
-                        self.refreshPanel();
-                        self.refreshDevicesTable();
-                    });
-                })
-            }, _('Refresh'))
-        ]);
-
-        setTimeout(function () { self.refreshDevicesTable(); }, 0);
-        return E('div', {}, [ toolbar, this.$devicesContainer ]);
-    },
-
-    onHeaderClick: function (key) {
-        if (this._sortKey === key) {
-            this._sortDir = (this._sortDir === 'asc') ? 'desc' : 'asc';
-        } else {
-            this._sortKey = key;
-            this._sortDir = (key === 'priority' || key === 'status') ? 'desc' : 'asc';
-        }
-        this.refreshDevicesTable();
-    },
-
-    makeHeader: function (key, label, width) {
-        var self = this;
-        var active = (this._sortKey === key);
-        var arrow  = active ? (this._sortDir === 'asc' ? ' \u25B2' : ' \u25BC') : '';
-
-        var attrs = {
-            'class': 'th',
-            'style': 'cursor: pointer; user-select: none;' +
-                     (active ? ' color: #37a;' : '')
-        };
-        if (width) attrs.width = width;
-
-        return E('th', attrs, [
-            E('span', {
-                'click': function (ev) {
-                    ev.preventDefault();
-                    self.onHeaderClick(key);
-                }
-            }, label + arrow)
-        ]);
-    },
-
-    makeComparator: function () {
-        var key = this._sortKey;
-        var dir = (this._sortDir === 'asc') ? 1 : -1;
-
-        return function (a, b) {
-            var va, vb;
-            switch (key) {
-            case 'status':   va = a.online ? 1 : 0; vb = b.online ? 1 : 0; break;
-            case 'hostname':
-                return dir * String(a.hostname || '').toLowerCase()
-                           .localeCompare(String(b.hostname || '').toLowerCase());
-            case 'mac':      return dir * String(a.mac).localeCompare(String(b.mac));
-            case 'ip':       va = ipSortKey(a.ip); vb = ipSortKey(b.ip); break;
-            case 'priority': va = a.gaming ? 1 : 0; vb = b.gaming ? 1 : 0; break;
-            default: return 0;
-            }
-            if (va < vb) return -1 * dir;
-            if (va > vb) return  1 * dir;
-            return 0;
-        };
-    },
-
-    refreshDevicesTable: function () {
-        var self = this;
-        if (!this.$devicesContainer) return;
-
-        var targets    = getTargetMacs();
-        var onlyGaming = this.$devicesOnlyToggle && this.$devicesOnlyToggle.checked;
-
-        var merged = [];
-        var seen   = {};
-
-        this.devices.forEach(function (d) {
-            seen[d.mac] = true;
-            merged.push({
-                mac:      d.mac,
-                ip:       d.ip || '-',
-                hostname: d.hostname || '?',
-                online:   d.online,
-                gaming:   targets.indexOf(d.mac) >= 0
+        // Initialize Chart.js after DOM is ready
+        setTimeout(function() {
+            loadChartScript().then(function() {
+                var ctx = document.getElementById('speedChart').getContext('2d');
+                var MAX_POINTS = 30;
+                
+                self.speedChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: new Array(MAX_POINTS).fill(''),
+                        datasets: [
+                            { label: 'Down', data: new Array(MAX_POINTS).fill(0), borderColor: '#00d2ff', backgroundColor: 'rgba(0,210,255,0.1)', borderWidth: 2, tension: 0.4, pointRadius: 0, fill: true },
+                            { label: 'Up',   data: new Array(MAX_POINTS).fill(0), borderColor: '#ff3333', backgroundColor: 'rgba(255,51,51,0.1)',   borderWidth: 2, tension: 0.4, pointRadius: 0, fill: true }
+                        ]
+                    },
+                    options: {
+                        responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
+                        plugins: { legend: { display: false } },
+                        scales: { x: { display: false }, y: { display: false, min: 0, suggestedMax: 15 } },
+                        layout: { padding: 0 }
+                    }
+                });
             });
-        });
+        }, 100);
 
-        targets.forEach(function (mac) {
-            if (seen[mac]) return;
-            merged.push({ mac: mac, ip: '-', hostname: '?',
-                          online: false, gaming: true });
-        });
+        return E('div', {}, [css, dashboard]);
+    },
 
-        if (onlyGaming)
-            merged = merged.filter(function (d) { return d.gaming; });
+    startPolling: function() {
+        var self = this;
+        
+        // Poll status and speed every 1 second
+        poll.add(function() {
+            return Promise.all([
+                callStatus().then(function(res) { self.status = res; }),
+                callIfaceStatus().then(function(res) {
+                    if (!res || !res.statistics) return;
+                    
+                    var now = Date.now();
+                    var rx = res.statistics.rx_bytes;
+                    var tx = res.statistics.tx_bytes;
 
-        var cmp = this.makeComparator();
-        merged.sort(function (a, b) {
-            var r = cmp(a, b);
-            if (r !== 0) return r;
-            return String(a.mac).localeCompare(String(b.mac));
-        });
+                    if (self.lastBytes) {
+                        var dt = (now - self.lastBytes.time) / 1000;
+                        if (dt > 0) {
+                            var rxMbps = (((rx - self.lastBytes.rx) * 8) / 1000000 / dt).toFixed(2);
+                            var txMbps = (((tx - self.lastBytes.tx) * 8) / 1000000 / dt).toFixed(2);
+                            
+                            // Update text
+                            var elDown = document.getElementById('dash-down');
+                            var elUp = document.getElementById('dash-up');
+                            if (elDown) elDown.innerText = '↓ ' + rxMbps + ' Mb/s';
+                            if (elUp) elUp.innerText = '↑ ' + txMbps + ' Mb/s';
 
-        var header = E('tr', { 'class': 'tr table-titles' }, [
-            this.makeHeader('status',   _('Status'),   '70px'),
-            this.makeHeader('hostname', _('Hostname')),
-            this.makeHeader('mac',      _('MAC Address')),
-            this.makeHeader('ip',       _('IP Address')),
-            this.makeHeader('priority', _('Priority'), '90px'),
-            E('th', { 'class': 'th', 'width': '140px' }, _('Actions'))
-        ]);
-
-        var rows = merged.map(function (d) {
-            var dot = E('span', {
-                'title': d.online ? _('Online') : _('Offline'),
-                'style': 'display:inline-block; width:12px; height:12px;' +
-                         ' border-radius:50%; background:' +
-                         (d.online ? '#5cb85c' : '#d9534f') + ';'
-            });
-
-            var priorityBadge = d.gaming
-                ? E('span', { 'class': 'label success' }, 'GAMING')
-                : E('span', { 'class': 'label' }, '\u2014');
-
-            var actionBtn = E('button', {
-                'class': 'cbi-button cbi-button-' + (d.gaming ? 'remove' : 'add'),
-                'click': ui.createHandlerFn(self, function () {
-                    return self.toggleMacPriority(d.mac, !d.gaming);
+                            // Update chart
+                            if (self.speedChart) {
+                                self.speedChart.data.datasets[0].data.shift();
+                                self.speedChart.data.datasets[0].data.push(parseFloat(rxMbps));
+                                self.speedChart.data.datasets[1].data.shift();
+                                self.speedChart.data.datasets[1].data.push(parseFloat(txMbps));
+                                self.speedChart.update();
+                            }
+                        }
+                    }
+                    self.lastBytes = { rx: rx, tx: tx, time: now };
                 })
-            }, d.gaming ? _('Remove') : _('Prioritize'));
-
-            return E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td center' }, dot),
-                E('td', { 'class': 'td' }, d.hostname),
-                E('td', { 'class': 'td', 'style': 'font-family: monospace' }, d.mac),
-                E('td', { 'class': 'td', 'style': 'font-family: monospace' }, d.ip),
-                E('td', { 'class': 'td center' }, priorityBadge),
-                E('td', { 'class': 'td center' }, actionBtn)
             ]);
-        });
-
-        if (rows.length === 0) {
-            rows.push(E('tr', { 'class': 'tr' }, [
-                E('td', { 'class': 'td', 'colspan': 6,
-                          'style': 'text-align:center; color:#888' },
-                  onlyGaming
-                    ? _('No gaming devices configured.')
-                    : _('No active DHCP leases.'))
-            ]));
-        }
-
-        var table = E('table', { 'class': 'table' }, [ header ].concat(rows));
-
-        while (this.$devicesContainer.firstChild)
-            this.$devicesContainer.removeChild(this.$devicesContainer.firstChild);
-        this.$devicesContainer.appendChild(table);
+        }, 1); // 1 second interval
     },
 
-    toggleMacPriority: function (mac, add) {
-        var self = this;
-        mac = normalizeMac(mac);
-
-        var cur = uci.get('myhelper', 'settings', 'target_mac') || [];
-        if (typeof cur === 'string') cur = [ cur ];
-        cur = cur.map(normalizeMac);
-
-        if (add) { if (cur.indexOf(mac) < 0) cur.push(mac); }
-        else     { cur = cur.filter(function (m) { return m !== mac; }); }
-
-        uci.set('myhelper', 'settings', 'target_mac', cur);
-
-        return uci.save().then(function () {
-            return uci.apply();
-        }).then(function () {
-            return callInit('myhelper-watchdog', 'restart');
-        }).then(function () {
-            ui.addNotification(null,
-                E('p', add
-                    ? _('MAC %s is now prioritized.').format(mac)
-                    : _('MAC %s removed from priority list.').format(mac)),
-                'info');
-            return self.pollStatus().then(function () {
-                self.refreshDevicesTable();
-            });
-        }).catch(function (err) {
-            ui.addNotification(null,
-                E('p', _('Toggle failed: %s').format(err)), 'error');
-        });
-    },
-
-    /* ---------------------------------------------------------------
-     * Form builder
-     * --------------------------------------------------------------- */
-
-    buildForm: function () {
-        var self = this;
-
-        var m = new form.Map(
-            'myhelper',
-            _('MyHelper Game Boost'),
-            _('Internet watchdog and gaming traffic prioritization for the Xiaomi Router BE3600.')
-        );
-
-
-        /* ---- Tab 1: Watchdog ---- */
-        var s = m.section(form.NamedSection, 'watchdog', 'myhelper', _('Watchdog'));
-
-        var o = s.option(form.Flag, 'enabled', _('Enable Watchdog'));
-        o.rmempty = false; o.default = '1';
-
-        o = s.option(form.Value, 'check_interval', _('Check Interval'),
-            _('Seconds between internet probes.'));
-        o.datatype = 'uinteger'; o.placeholder = '60'; o.default = '60';
-        o.depends('enabled', '1');
-
-        o = s.option(form.Value, 'fail_threshold', _('Failure Threshold'),
-            _('Consecutive failed probes before WAN recovery triggers.'));
-        o.datatype = 'uinteger'; o.placeholder = '3'; o.default = '3';
-        o.depends('enabled', '1');
-
-        o = s.option(form.Value, 'wan_interface', _('WAN Interface'));
-        o.placeholder = 'wan'; o.default = 'wan'; o.rmempty = false;
-        o.depends('enabled', '1');
-
-        o = s.option(form.Value, 'probe_host_1', _('Primary Probe Host'));
-        o.datatype = 'hostname4'; o.placeholder = '1.1.1.1'; o.default = '1.1.1.1';
-        o.depends('enabled', '1');
-
-        o = s.option(form.Value, 'probe_host_2', _('Secondary Probe Host'));
-        o.datatype = 'hostname4'; o.placeholder = '8.8.8.8'; o.default = '8.8.8.8';
-        o.depends('enabled', '1');
-
-        /* ---- Tab 2: Game Boost ---- */
-        s = m.section(form.NamedSection, 'settings', 'game_boost', _('Game Boost'));
-
-        o = s.option(form.Flag, 'enabled', _('Enable Game Boost'));
-        o.rmempty = false; o.default = '0';
-
-        o = s.option(form.ListValue, 'qos_preset', _('CAKE Preset'),
-            _('Traffic shaping profile. Choose "Low Latency" for competitive gaming, ' +
-              '"Balanced" for mixed home use, "Max Throughput" for pure bandwidth.'));
-        CAKE_PRESETS.forEach(function (p) {
-            o.value(p.value, _(p.label));
-        });
-        o.default = 'balanced';
-        o.rmempty = false;
-        o.depends('enabled', '1');
-        o = s.option(form.ListValue, 'qos_preset', _('CAKE Preset'),
-    _('Traffic shaping profile. Choose "Low Latency" for competitive gaming, ' +
-      '"Balanced" for mixed home use, "Max Throughput" for pure bandwidth.'));
-CAKE_PRESETS.forEach(function (p) {
-    o.value(p.value, _(p.label));
-});
-o.default = 'balanced';
-o.rmempty = false;
-o.depends('enabled', '1');
-        
-/* ---------- HFSC Game Boost parameters ---------- */
-o = s.option(form.Value, 'game_bandwidth_guarantee',
-    _('Game Bandwidth Guarantee'),
-    _('Guaranteed kbit/s for game traffic (HFSC). For 100 Mbit link ' +
-      'recommend 5000-10000. Only used by "Game Boost" preset.'));
-o.datatype = 'uinteger';
-o.placeholder = '8000';
-o.default = '8000';
-o.depends('qos_preset', 'game_boost');
-
-o = s.option(form.Value, 'game_pfifo_limit',
-    _('Game Packet Queue Limit'),
-    _('pfifo queue depth for game class. Lower = lower latency, ' +
-      'but drops on burst. 10 packets is a good default.'));
-o.datatype = 'uinteger';
-o.placeholder = '10';
-o.default = '10';
-o.depends('qos_preset', 'game_boost');
-
-        o = s.option(form.DynamicList, 'target_mac', _('Gaming Device MACs'),
-            _('Traffic to/from these MACs is marked DSCP CS6.'));
-        o.datatype = 'macaddr'; o.placeholder = 'aa:bb:cc:dd:ee:ff';
-        o.depends('enabled', '1');
-        var origWrite = o.write;
-        o.write = function (sid, v) {
-            return origWrite.call(this, sid, normalizeMac(v));
-        };
-        o.validate = function (sid, value) {
-            if (!value) return true;
-            var norm = normalizeMac(value);
-            if (!MAC_RE.test(norm))
-                return _('Invalid MAC address: "%s"').format(value);
-            if (norm === 'ff:ff:ff:ff:ff:ff' || norm === '00:00:00:00:00:00')
-                return _('Special MAC not allowed: %s').format(norm);
-            var cur = uci.get('myhelper', sid, 'target_mac') || [];
-            if (typeof cur === 'string') cur = [ cur ];
-            var matches = 0;
-            cur.forEach(function (m) { if (normalizeMac(m) === norm) matches++; });
-            if (matches > 1)
-                return _('Duplicate MAC: %s').format(norm);
-            return true;
-        };
-
-        o = s.option(form.Value, 'ports', _('Gaming Ports'),
-            _('Comma-separated TCP/UDP ports, e.g. 3074,27015,27016.'));
-        o.placeholder = '3074,27015,27016';
-        o.depends('enabled', '1');
-        o.validate = function (sid, value) {
-            if (!value) return true;
-            var parts = String(value).split(',');
-            for (var i = 0; i < parts.length; i++) {
-                var p = parts[i].trim();
-                if (!/^[0-9]+$/.test(p) ||
-                    parseInt(p, 10) < 1 || parseInt(p, 10) > 65535)
-                    return _('Invalid port: "%s"').format(p);
-            }
-            return true;
-        };
-
-        o = s.option(form.Value, 'bandwidth_upload', _('Upload Bandwidth'),
-            _('CAKE egress rate, e.g. "20mbit". "0" disables.'));
-        o.placeholder = '0'; o.depends('enabled', '1');
-
-        o = s.option(form.Value, 'bandwidth_download', _('Download Bandwidth'),
-            _('CAKE ingress rate via IFB, e.g. "200mbit". "0" disables.'));
-        o.placeholder = '0'; o.depends('enabled', '1');
-        
-/* ---------- Link layer adaptation ---------- */
-o = s.option(form.ListValue, 'linklayer', _('Link Layer'),
-    _('Type of link for overhead calculation.'));
-o.value('none',     _('None (raw IP)'));
-o.value('ethernet', _('Ethernet (14 bytes header)'));
-o.value('atm',      _('ATM (for ADSL)'));
-o.default = 'ethernet';
-o.rmempty = false;
-
-o = s.option(form.Value, 'overhead', _('Overhead (bytes)'),
-    _('Bytes to add per packet. DHCP+Ethernet: 34. ' +
-      'PPPoE: 42. PPPoE+VLAN: 46.'));
-o.datatype = 'uinteger';
-o.placeholder = '34';
-o.default = '34';
-
-/* ---------- BBR congestion control ---------- */
-o = s.option(form.Flag, 'bbr_enabled', _('Enable BBR'),
-    _('Google BBR TCP congestion control. Reduces latency on lossy ' +
-      'links. May cause UDP issues on some ISPs — roll back if game ' +
-      'voice chat breaks.'));
-o.rmempty = false;
-o.default = '0';
-
-        /* ---- Tab 3: Devices ---- */
-        s = m.section(form.NamedSection, 'settings', '_devices_sec', _('Devices'));
-
-            o = s.option(form.DummyValue, '_devices');
-    o.rawhtml  = false;
-    o.cfgvalue = function () { return ''; };
-    o.render   = function () { return self.renderDevicesTable(); };
-
-    /* ---- Speedtest button ---- */
-    var callSpeedtest = rpc.declare({
-        object: 'rc',
-        method: 'init',
-        params: [ 'name', 'action' ],
-        expect: { result: false }
-    });
-
-    s = m.section(form.NamedSection, 'settings', '_bw_sec',
-                  _('Bandwidth Measurement'));
-
-    o = s.option(form.DummyValue, '_speedtest');
-    o.rawhtml  = false;
-    o.cfgvalue = function () { return ''; };
-    o.render   = function () {
-        var btn = E('button', {
-            'class': 'cbi-button cbi-button-action',
-            'click': ui.createHandlerFn(this, function (ev) {
-                ev.preventDefault();
-                ui.showModal(_('Speedtest'), [
-                    E('p', { 'class': 'spinning' },
-                      _('Measuring speed... This takes 30-60 seconds.'))
-                ]);
-                return callSpeedtest('myhelper-watchdog', 'speedtest')
-                    .then(function () {
-                        ui.hideModal();
-                        ui.addNotification(null,
-                            E('p', _('Speedtest complete. Reload the page ' +
-                                     'to see updated values.')), 'info');
-                    }).catch(function (err) {
-                        ui.hideModal();
-                        ui.addNotification(null,
-                            E('p', _('Speedtest failed: %s').format(err)),
-                            'error');
-                    });
-            })
-        }, _('Measure Speed Now'));
-
-        return E('div', { 'class': 'cbi-value' }, [
-            E('label', { 'class': 'cbi-value-title' }, _('Speedtest')),
-            E('div', { 'class': 'cbi-value-field' }, [
-                btn,
-                E('div', { 'style': 'font-size: 11px; color: #666; ' +
-                                   'margin-top: 4px;' },
-                  _('Runs speedtest-netperf and stores results in UCI. ' +
-                    'Use this to auto-fill bandwidth values above.'))
-            ])
-        ]);
-    };
-
-    return m;
-    },
-
-    /* ---------------------------------------------------------------
-     * Render
-     * --------------------------------------------------------------- */
-
-    render: function () {
-        var self = this;
-        this.formMap = this.buildForm();
-        return this.formMap.render().then(function (root) {
-            root.insertBefore(self.renderStatusPanel(), root.firstChild);
-
-            setTimeout(function () {
-                var panel = root.querySelector('.cbi-tab-descr[id$="monitor"],' +
-                                              ' .cbi-tab[id$="monitor"]');
-                var host  = panel || root;
-                var container = E('div', { id: 'myhelper-graphs' });
-
-                container.style.display = 'flex';
-                container.style.gap = '16px';
-                container.style.flexWrap = 'wrap';
-
-                var s = self.status || {};
-                var gInternet = E('div', { style: 'flex: 1 1 45%; min-width: 320px;' });
-                var gDevice   = E('div', { style: 'flex: 1 1 45%; min-width: 320px;' });
-
-                gInternet.appendChild(renderSvgGraph(s.history || [], {
-                    title:    _('Latency to Internet'),
-                    subtitle: _('Targets: 1.1.1.1 / 8.8.8.8')
-                }));
-                gDevice.appendChild(renderSvgGraph(s.history_device || [], {
-                    title:     _('Latency to Gaming Device'),
-                    subtitle:  s.gaming_ip
-                        ? _('Target: %s').format(s.gaming_ip)
-                        : _('No gaming device resolved'),
-                    emptyText: _('No gaming device configured or no active lease.')
-                }));
-
-                container.appendChild(gInternet);
-                container.appendChild(gDevice);
-                host.appendChild(container);
-
-                self.$graphs = { root: container, internet: gInternet, device: gDevice };
-            }, 100);
-
-            self.startPolling();
-            return root;
-        });
-    },
-
-    refreshGraphs: function () {
-        if (!this.$graphs) return;
-        var s = this.status || {};
-
-        while (this.$graphs.internet.firstChild)
-            this.$graphs.internet.removeChild(this.$graphs.internet.firstChild);
-        while (this.$graphs.device.firstChild)
-            this.$graphs.device.removeChild(this.$graphs.device.firstChild);
-
-        this.$graphs.internet.appendChild(renderSvgGraph(s.history || [], {
-            title:    _('Latency to Internet'),
-            subtitle: _('Targets: 1.1.1.1 / 8.8.8.8')
-        }));
-        this.$graphs.device.appendChild(renderSvgGraph(s.history_device || [], {
-            title:     _('Latency to Gaming Device'),
-            subtitle:  s.gaming_ip
-                ? _('Target: %s').format(s.gaming_ip)
-                : _('No gaming device resolved'),
-            emptyText: _('No gaming device configured or no active lease.')
-        }));
-    },
-
-    startPolling: function () {
-        var self = this;
-        this._pollTimer = window.setInterval(function () {
-            self.pollStatus().then(function () {
-                self.refreshPanel();
-                self.refreshDevicesTable();
-                self.refreshGraphs();
-            });
-        }, 3000);
-    },
-
-    handleSaveApply: function (ev, mode) {
-        var self = this;
-        return this.formMap.handleSaveApply(ev, mode).then(function () {
-            return callInit('myhelper-watchdog', 'restart');
-        }).then(function () {
-            ui.addNotification(null,
-                E('p', _('Configuration saved and service restarted.')), 'info');
-            return self.pollStatus().then(function () {
-                self.refreshPanel();
-                self.refreshDevicesTable();
-                self.refreshGraphs();
-            });
-        }).catch(function (err) {
-            ui.addNotification(null,
-                E('p', _('Restart failed: %s').format(err)), 'error');
-        });
-    },
-
-    handleReset: function (ev, mode) {
-        return this.formMap.handleReset(ev, mode);
-    },
-
-    destroy: function () {
-        if (this._pollTimer) {
-            window.clearInterval(this._pollTimer);
-            this._pollTimer = null;
-        }
-        return this.super('destroy');
+    render: function() {
+        var root = this.super('render', arguments); // Get base LuCI wrapper
+        this.startPolling();
+        return root;
     }
 });
