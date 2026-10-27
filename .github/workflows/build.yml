@@ -40,13 +40,17 @@ jobs:
           mkdir -p openwrt-src/package/myhelper
           cp -r package/myhelper/* openwrt-src/package/myhelper/
           ls -la openwrt-src/package/myhelper/
-      - name: Inject custom sysauth.ut
+
+      - name: Inject custom sysauth.ut overlay
         run: |
           set -e
+          # Создаем структуру папок в исходниках OpenWrt
           mkdir -p openwrt-src/files/usr/share/ucode/luci/template/themes/argon
-          cp files/usr/share/ucode/luci/template/themes/argon/sysauth.ut \
-             openwrt-src/files/usr/share/ucode/luci/template/themes/argon/sysauth.ut
-          echo "=== sysauth.ut injected to firmware overlay ==="
+          
+          # Копируем файл из корня вашего репозитория (files/) в исходники (openwrt-src/files/)
+          cp files/usr/share/ucode/luci/template/themes/argon/sysauth.ut openwrt-src/files/usr/share/ucode/luci/template/themes/argon/sysauth.ut
+          
+          echo "=== Custom sysauth.ut overlay injected successfully ==="
           ls -la openwrt-src/files/usr/share/ucode/luci/template/themes/argon/
 
       - name: Fix Makefile tabs
