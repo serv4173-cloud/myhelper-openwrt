@@ -635,8 +635,12 @@ static int reapply_game_qos(void)
         return -1;
     }
     if (pid == 0) {
+        /* ФИКС: закрываем унаследованные сокеты */
+        for (int i = 3; i < 1024; i++) close(i);
+        freopen("/dev/null", "r", stdin);
         freopen("/dev/null", "w", stdout);
         freopen("/dev/null", "w", stderr);
+        
         execl("/etc/init.d/myhelper-watchdog",
               "myhelper-watchdog", "apply_qos", (char *)NULL);
         _exit(127);
@@ -668,25 +672,58 @@ static int reapply_game_qos(void)
 /* ============================================================
  *  Async speedtest
  * ============================================================ */
-static void speedtest_child_cb(struct uloop_process *p, int ret)
+static int ubus_speedtest_cb(struct ubus_context *ctx, struct ubus_object *obj,
+                             struct ubus_request_data *req, const char *method,
+                             struct blob_attr *msg)
 {
-    (void)p;
-    int rc = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) ? 0 : -1;
+    (void)obj; (void)method; (void)msg;
 
-    g_speedtest_running  = 0;
-    g_speedtest_last_ts  = (uint32_t)time(NULL);
-    g_speedtest_last_rc  = rc;
-
-    if (rc == 0) {
-        snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg), "OK");
-        event_push(EV_SPEEDTEST_OK, "speedtest completed");
-        MY_LOG(LOG_INFO, "speedtest completed successfully");
-    } else {
-        snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg),
-                 "failed (rc=%d)", rc);
-        event_push(EV_SPEEDTEST_FAIL, "speedtest failed (rc=%d)", rc);
-        MY_LOG(LOG_WARNING, "speedtest failed (rc=%d)", rc);
+    if (g_speedtest_running) {
+        blob_buf_init(&g_bbuf, 0);
+        blobmsg_add_u8 (&g_bbuf, "ok", 0);
+        blobmsg_add_u8 (&g_bbuf, "busy", 1);
+        blobmsg_add_u32(&g_bbuf, "started_at", g_speedtest_start_ts);
+        ubus_send_reply(ctx, req, g_bbuf.head);
+        return 0;
     }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        blob_buf_init(&g_bbuf, 0);
+        blobmsg_add_u8 (&g_bbuf, "ok", 0);
+        blobmsg_add_string(&g_bbuf, "error", "fork failed");
+        ubus_send_reply(ctx, req, g_bbuf.head);
+        return 0;
+    }
+    if (pid == 0) {
+        /* ФИКС: закрываем унаследованные сокеты, чтобы rpcd не ждал */
+        for (int i = 3; i < 1024; i++) close(i);
+        freopen("/dev/null", "r", stdin);
+        freopen("/dev/null", "w", stdout);
+        freopen("/dev/null", "w", stderr);
+        
+        execl("/etc/init.d/myhelper-watchdog",
+              "myhelper-watchdog", "speedtest", (char *)NULL);
+        _exit(127);
+    }
+
+    g_speedtest_running  = 1;
+    g_speedtest_start_ts = (uint32_t)time(NULL);
+
+    memset(&g_speedtest_proc, 0, sizeof(g_speedtest_proc));
+    g_speedtest_proc.cb  = speedtest_child_cb;
+    g_speedtest_proc.pid = pid;
+    uloop_process_add(&g_speedtest_proc);
+
+    event_push(EV_SPEEDTEST_START, "speedtest started (pid=%d)", pid);
+    MY_LOG(LOG_INFO, "speedtest started (pid=%d)", pid);
+
+    blob_buf_init(&g_bbuf, 0);
+    blobmsg_add_u8 (&g_bbuf, "ok", 1);
+    blobmsg_add_u8 (&g_bbuf, "busy", 0);
+    blobmsg_add_u32(&g_bbuf, "started_at", g_speedtest_start_ts);
+    ubus_send_reply(ctx, req, g_bbuf.head);
+    return 0;
 }
 
 /* ============================================================
