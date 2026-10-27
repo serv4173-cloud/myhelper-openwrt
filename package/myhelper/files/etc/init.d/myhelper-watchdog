@@ -47,8 +47,6 @@ start_service() {
         procd_set_param stderr 1
         procd_close_instance
     fi
-
-    apply_bbr
     apply_qos
 }
 
@@ -351,6 +349,7 @@ apply_qos() {
         logger -t myhelper-watchdog "game_boost disabled, cleaning up"
         cleanup_qos
         rm -f "$GAMING_IP_FILE"
+        apply_bbr
         return 0
     fi
 
@@ -364,11 +363,13 @@ apply_qos() {
 
     if ! nft add table inet "$NFT_TABLE"; then
         logger -t myhelper-watchdog "CRITICAL: nft add table failed"
+        apply_bbr
         return 1
     fi
     if ! nft add chain inet "$NFT_TABLE" mark_out \
         '{ type filter hook postrouting priority mangle ; policy accept ; }'; then
         logger -t myhelper-watchdog "CRITICAL: nft add chain failed"
+        apply_bbr
         return 1
     fi
 
@@ -545,6 +546,7 @@ apply_qos() {
     else
         logger -t myhelper-watchdog "game_boost applied with errors (err=1)"
     fi
+    apply_bbr
     return "$err"
 }
 
