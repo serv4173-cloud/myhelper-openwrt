@@ -166,6 +166,23 @@ jobs:
             echo "OK: ${pkg}"
           done
 
+      - name: Static checks for myhelper package
+        run: |
+          set -eu
+          sh -n openwrt-src/package/myhelper/files/etc/init.d/myhelper-watchdog
+          sh -n openwrt-src/package/myhelper/files/etc/init.d/luci-fail2ban
+          sh -n openwrt-src/package/myhelper/files/usr/bin/luci-fail2ban.sh
+          grep -q "kmod-sched-core" openwrt-src/package/myhelper/Makefile
+          if grep -Eq 'kmod-net-sched|kmod-sched-hfsc|kmod-act-mirred|kmod-act-gact|kmod-sch-ingress' openwrt-src/package/myhelper/Makefile; then
+            echo "ERROR: invalid split scheduler package dependency remains"
+            exit 1
+          fi
+          grep -q "grep -oE '\[0-9\]+(\[.\]\[0-9\]+)?'" openwrt-src/package/myhelper/files/etc/init.d/myhelper-watchdog || {
+            echo "ERROR: speedtest numeric parser does not accept integers and decimals"
+            exit 1
+          }
+          echo "Static shell and package checks passed"
+
       - name: Build kmod toolchain (GCC 7.5.0)
         run: |
           set -e
