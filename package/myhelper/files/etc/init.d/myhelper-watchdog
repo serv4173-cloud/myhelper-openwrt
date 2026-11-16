@@ -158,6 +158,34 @@ resolve_mac_to_ip() {
     return 1
 }
 
+QOS_ROOT_STATE="/var/run/myhelper-qos-root"
+
+remove_owned_root_qdisc() {
+    local dev="$1" recorded_dev recorded_kind recorded_handle current
+    [ -r "$QOS_ROOT_STATE" ] || return 0
+    read -r recorded_dev recorded_kind recorded_handle < "$QOS_ROOT_STATE"
+    [ "$recorded_dev" = "$dev" ] || return 0
+    current=$(tc qdisc show dev "$dev" root 2>/dev/null)
+    case "$recorded_kind:$recorded_handle" in
+        cake:8001:)
+            echo "$current" | grep -Eq 'qdisc cake 8001: root' || return 0 ;;
+        hfsc:1:)
+            echo "$current" | grep -Eq 'qdisc hfsc 1: root' || return 0 ;;
+        *) return 0 ;;
+    esac
+    tc qdisc del dev "$dev" root 2>/dev/null
+    rm -f "$QOS_ROOT_STATE"
+}
+
+remove_owned_ingress_filter() {
+    local dev="$1" filters
+    filters=$(tc filter show dev "$dev" parent ffff: 2>/dev/null)
+    # We use a dedicated preference and IFB target. Never delete a foreign filter.
+    if echo "$filters" | grep -q 'mirred.*redirect.*ifb-myhelper'; then
+        tc filter del dev "$dev" parent ffff: protocol all pref 49152 2>/dev/null
+    fi
+}
+
 cleanup_qos() {
     nft delete table inet "$NFT_TABLE" 2>/dev/null
 
@@ -167,13 +195,15 @@ cleanup_qos() {
     [ -n "$wan_iface" ] || wan_iface="wan"
     wan_dev=$(resolve_wan_dev "$wan_iface")
 
-    [ -n "$wan_dev" ] && {
-        tc qdisc del dev "$wan_dev" root 2>/dev/null
-        tc qdisc del dev "$wan_dev" ingress 2>/dev/null
-    }
+    if [ -n "$wan_dev" ]; then
+        remove_owned_root_qdisc "$wan_dev"
+        remove_owned_ingress_filter "$wan_dev"
+        # Do not delete the ingress qdisc: it may be shared with other software.
+    fi
+    # This interface name is reserved for MyHelper.
     ip link del "$IFB_DEV" 2>/dev/null
 
-    logger -t myhelper-watchdog "QoS rules cleaned up"
+    logger -t myhelper-watchdog "MyHelper-owned QoS rules cleaned up"
     return 0
 }
 
@@ -311,7 +341,11 @@ apply_hfsc_game_boost() {
     logger -t myhelper-watchdog \
         "HFSC game_boost: total=${total_bw}kbit game=${game_bw}kbit pfifo=$pfifo_limit"
 
-    tc qdisc del dev "$dev" root 2>/dev/null
+    remove_owned_root_qdisc "$dev"
+    if ! tc qdisc show dev "$dev" root 2>/dev/null | grep -q 'qdisc noqueue'; then
+        logger -t myhelper-watchdog "HFSC: root qdisc already exists; refusing to replace it"
+        return 1
+    fi
 
     if ! tc qdisc add dev "$dev" root handle 1: hfsc default 30; then
         logger -t myhelper-watchdog "HFSC: root qdisc add failed"
@@ -341,6 +375,7 @@ apply_hfsc_game_boost() {
     fi
 
     if [ "$err" -eq 0 ]; then
+        echo "$dev hfsc 1:" > "$QOS_ROOT_STATE"
         logger -t myhelper-watchdog "HFSC game_boost applied on $dev"
     else
         logger -t myhelper-watchdog "HFSC game_boost partially applied on $dev"
@@ -517,13 +552,21 @@ apply_qos() {
             cake_ll_suffix=$(cake_linklayer_suffix "$linklayer" "$overhead")
             logger -t myhelper-watchdog \
                 "cake egress dev=$wan_dev rate=$bw_up preset=$qos_preset"
-            tc qdisc del dev "$wan_dev" root 2>/dev/null
-            # shellcheck disable=SC2086
-            if ! tc qdisc add dev "$wan_dev" root cake \
-                bandwidth "$bw_up" \
-                $cake_flags $cake_ll_suffix \
-                memlimit 32mb ; then
-                logger -t myhelper-watchdog "cake egress FAILED"; err=1
+            remove_owned_root_qdisc "$wan_dev"
+            # Do not replace an unrelated root qdisc (e.g. SQM).
+            if ! tc qdisc show dev "$wan_dev" root 2>/dev/null | grep -q 'qdisc noqueue'; then
+                logger -t myhelper-watchdog "cake egress: root qdisc already exists; refusing to replace it"
+                err=1
+            else
+                # shellcheck disable=SC2086
+                if tc qdisc add dev "$wan_dev" root handle 8001: cake \
+                    bandwidth "$bw_up" \
+                    $cake_flags $cake_ll_suffix \
+                    memlimit 32mb ; then
+                    echo "$wan_dev cake 8001:" > "$QOS_ROOT_STATE"
+                else
+                    logger -t myhelper-watchdog "cake egress FAILED"; err=1
+                fi
             fi
         fi
     fi
@@ -541,16 +584,20 @@ apply_qos() {
             logger -t myhelper-watchdog "ingress: ip link set up failed"; err=1
         fi
 
-        tc qdisc del dev "$wan_dev" ingress 2>/dev/null
-        if ! tc qdisc add dev "$wan_dev" handle ffff: ingress; then
-            logger -t myhelper-watchdog "ingress: qdisc ingress add failed"; err=1
+        # Keep any existing ingress qdisc; remove only our own redirect filter.
+        remove_owned_ingress_filter "$wan_dev"
+        if ! tc qdisc show dev "$wan_dev" | grep -q 'qdisc ingress ffff:'; then
+            if ! tc qdisc add dev "$wan_dev" handle ffff: ingress; then
+                logger -t myhelper-watchdog "ingress: qdisc ingress add failed"; err=1
+            fi
         fi
-        if ! tc filter add dev "$wan_dev" parent ffff: protocol all u32 \
+        if ! tc filter add dev "$wan_dev" parent ffff: protocol all pref 49152 u32 \
             match u32 0 0 \
             action mirred egress redirect dev "$IFB_DEV"; then
             logger -t myhelper-watchdog "ingress: mirred filter add failed"; err=1
         fi
 
+        # IFB is dedicated to MyHelper; its root qdisc can be replaced safely.
         tc qdisc del dev "$IFB_DEV" root 2>/dev/null
         # shellcheck disable=SC2086
         if ! tc qdisc add dev "$IFB_DEV" root cake \
