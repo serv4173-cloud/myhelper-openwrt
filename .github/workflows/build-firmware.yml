@@ -171,16 +171,20 @@ jobs:
             fi
             echo "OK: ${pkg}"
           done
-          # Require zapret only if the feeds provide it; report exact Kconfig
-          # symbols when the package is missing/renamed instead of failing blindly.
+          # zapret is a requested feature: fail with feed diagnostics instead
+          # of silently producing firmware without it.
           for pkg in zapret luci-app-zapret; do
-            if grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
-              echo "OK: ${pkg}"
-            else
-              echo "WARNING: ${pkg} is not enabled; checking whether a package definition exists"
-              find package/feeds -path "*/${pkg}/Makefile" -o -path "*/${pkg}/Makefile" 2>/dev/null | head -5 || true
-              grep -R -l "define Package/${pkg}" package/feeds feeds 2>/dev/null | head -5 || true
+            if ! grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "ERROR: required package ${pkg} is unavailable or not selectable after defconfig"
+              echo "=== Feed search ==="
+              ./scripts/feeds search "${pkg}" || true
+              echo "=== Matching package definitions ==="
+              grep -R -l "define Package/${pkg}" package/feeds feeds 2>/dev/null | head -20 || true
+              echo "=== Kconfig result ==="
+              grep -E "^CONFIG_PACKAGE_.*(zapret|nftables).*=" .config || true
+              exit 1
             fi
+            echo "OK: ${pkg}"
           done
 
       - name: Static checks for myhelper package
