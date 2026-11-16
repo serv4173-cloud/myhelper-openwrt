@@ -185,6 +185,8 @@ static uint32_t    g_speedtest_last_ts      = 0;
 static int         g_speedtest_last_rc      = -1;
 static char        g_speedtest_last_msg[EVENT_DETAIL_LEN] = "";
 static struct uloop_process g_speedtest_proc;
+static int g_qos_reapply_running = 0;
+static struct uloop_process g_qos_reapply_proc;
 
 /* ---------------- uloop / ubus ---------------- */
 static struct uloop_timeout  g_check_timer;
@@ -687,10 +689,34 @@ static int recover_wan(void)
 }
 
 /* ============================================================
- *  QoS reapply (synchronous — short)
+ *  QoS reapply (asynchronous — never block uloop)
  * ============================================================ */
+static void qos_reapply_child_cb(struct uloop_process *p, int ret)
+{
+    (void)p;
+    g_qos_reapply_running = 0;
+    refresh_gaming_ip();
+
+    if (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) {
+        event_push(EV_QOS_OK, "apply_qos completed rc=0");
+        MY_LOG(LOG_INFO, "apply_qos completed successfully");
+    } else if (WIFEXITED(ret)) {
+        int rc = WEXITSTATUS(ret);
+        event_push(EV_QOS_FAIL, "apply_qos exited rc=%d", rc);
+        MY_LOG(LOG_WARNING, "apply_qos exited rc=%d", rc);
+    } else {
+        event_push(EV_QOS_FAIL, "apply_qos terminated (status=0x%x)", ret);
+        MY_LOG(LOG_WARNING, "apply_qos terminated (status=0x%x)", ret);
+    }
+}
+
 static int reapply_game_qos(void)
 {
+    if (g_qos_reapply_running) {
+        MY_LOG(LOG_INFO, "QoS reapply already running; skipping duplicate");
+        return -1;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         MY_LOG(LOG_ERR, "reapply_game_qos fork failed: %s", strerror(errno));
@@ -698,38 +724,28 @@ static int reapply_game_qos(void)
         return -1;
     }
     if (pid == 0) {
-        /* ФИКС: закрываем унаследованные сокеты */
         for (int i = 3; i < 1024; i++) close(i);
         freopen("/dev/null", "r", stdin);
         freopen("/dev/null", "w", stdout);
         freopen("/dev/null", "w", stderr);
-        
         execl("/etc/init.d/myhelper-watchdog",
               "myhelper-watchdog", "apply_qos", (char *)NULL);
         _exit(127);
     }
 
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        MY_LOG(LOG_ERR, "waitpid failed: %s", strerror(errno));
-        event_push(EV_QOS_FAIL, "waitpid failed");
+    memset(&g_qos_reapply_proc, 0, sizeof(g_qos_reapply_proc));
+    g_qos_reapply_proc.cb = qos_reapply_child_cb;
+    g_qos_reapply_proc.pid = pid;
+    g_qos_reapply_running = 1;
+    if (uloop_process_add(&g_qos_reapply_proc) != 0) {
+        g_qos_reapply_running = 0;
+        kill(pid, SIGTERM);
+        MY_LOG(LOG_ERR, "failed to register QoS child with uloop");
+        event_push(EV_QOS_FAIL, "uloop_process_add failed");
         return -1;
     }
-    refresh_gaming_ip();
-
-    if (!WIFEXITED(status)) {
-        MY_LOG(LOG_WARNING, "apply_qos terminated abnormally (0x%x)", status);
-        event_push(EV_QOS_FAIL, "apply_qos killed (status=0x%x)", status);
-        return -1;
-    }
-    int rc = WEXITSTATUS(status);
-    if (rc == 0) {
-        event_push(EV_QOS_OK, "apply_qos rc=0");
-    } else {
-        MY_LOG(LOG_WARNING, "apply_qos exited rc=%d", rc);
-        event_push(EV_QOS_FAIL, "apply_qos rc=%d", rc);
-    }
-    return rc;
+    MY_LOG(LOG_INFO, "QoS reapply started asynchronously (pid=%d)", pid);
+    return 0;
 }
 
 /* ============================================================
@@ -976,6 +992,22 @@ static void qos_timer_cb(struct uloop_timeout *t)
     int rc = reapply_game_qos();
     if (rc != 0)
         MY_LOG(LOG_WARNING, "Post-recovery QoS reapply failed (rc=%d)", rc);
+}
+
+static void speedtest_child_cb(struct uloop_process *p, int ret)
+{
+    (void)p;
+    g_speedtest_running = 0;
+    g_speedtest_last_ts = (uint32_t)time(NULL);
+    g_speedtest_last_rc = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) ? 0 : -1;
+    snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg),
+             g_speedtest_last_rc == 0 ? "completed" : "failed (status=0x%x)", ret);
+    event_push(g_speedtest_last_rc == 0 ? EV_SPEEDTEST_DONE : EV_SPEEDTEST_FAIL,
+               "speedtest %s (status=0x%x)",
+               g_speedtest_last_rc == 0 ? "completed" : "failed", ret);
+    MY_LOG(g_speedtest_last_rc == 0 ? LOG_INFO : LOG_WARNING,
+           "speedtest %s (status=0x%x)",
+           g_speedtest_last_rc == 0 ? "completed" : "failed", ret);
 }
 
 /* ============================================================
