@@ -237,7 +237,30 @@ cake_preset_flags() {
 cake_linklayer_suffix() {
     local ll="$1" oh="$2"
     local s=""
-    [ -n "$oh" ] && [ "$oh" != "0" ] && s="overhead $oh"
+
+    # CAKE requires an explicit link-layer mode for overhead compensation.
+    # Keep user-controlled values constrained to supported tc-cake tokens.
+    case "$ll" in
+        ethernet|"") s="ethernet" ;;
+        atm)         s="atm" ;;
+        ptm)         s="ptm" ;;
+        raw|none)    s="raw" ;;
+        *)
+            logger -t myhelper-watchdog "CAKE: unsupported linklayer '$ll'; using ethernet"
+            s="ethernet"
+            ;;
+    esac
+
+    case "$oh" in
+        ""|0) ;;
+        *[!0-9]*)
+            logger -t myhelper-watchdog "CAKE: invalid overhead '$oh'; ignoring"
+            ;;
+        *)
+            # Raw mode deliberately disables link-layer overhead accounting.
+            [ "$s" = "raw" ] || s="$s overhead $oh"
+            ;;
+    esac
     echo "$s"
 }
 
