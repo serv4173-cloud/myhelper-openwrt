@@ -12,7 +12,7 @@ define Package/myhelper
     SECTION:=utils
     CATEGORY:=Utilities
     TITLE:=Internet watchdog + Game Boost for Xiaomi BE3600
-    DEPENDS:=+ubus +libubus +libubox
+    DEPENDS:=+ubus +libubus +libubox +nftables +tc +kmod-nft-core +kmod-net-sched +kmod-sched-cake +kmod-sched-hfsc +kmod-ifb +kmod-act-mirred +kmod-act-gact +kmod-sch-ingress +kmod-tcp-bbr
     MAINTAINER:=you@example.com
 endef
 
