@@ -143,7 +143,7 @@ jobs:
           cd openwrt-src
           echo "CONFIG_PACKAGE_myhelper=y"             >> .config
           echo "CONFIG_PACKAGE_nftables-nojson=y"            >> .config
-          echo "CONFIG_PACKAGE_tc=y"                  >> .config
+          echo "CONFIG_PACKAGE_tc-tiny=y"             >> .config
           echo "CONFIG_PACKAGE_ethtool=y"             >> .config
           echo "CONFIG_PACKAGE_kmod-sched-cake=y"     >> .config
           echo "CONFIG_PACKAGE_kmod-ifb=y"            >> .config
@@ -159,7 +159,7 @@ jobs:
           # the virtual package "nftables" required by myhelper.
           sed -i 's/^CONFIG_PACKAGE_nftables-nojson=m$/CONFIG_PACKAGE_nftables-nojson=y/' .config
           for pkg in \
-            myhelper nftables-nojson tc ethtool \
+            myhelper nftables-nojson tc-tiny ethtool \
             kmod-sched-core kmod-sched-cake kmod-ifb kmod-nft-core kmod-tcp-bbr \
             zapret luci-app-zapret; do
             if ! grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
