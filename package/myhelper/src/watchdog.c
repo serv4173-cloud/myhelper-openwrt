@@ -1023,56 +1023,6 @@ static int ubus_qos_reapply_cb(struct ubus_context *ctx, struct ubus_object *obj
     return 0;
 }
 
-static int ubus_speedtest_cb(struct ubus_context *ctx, struct ubus_object *obj,
-                             struct ubus_request_data *req, const char *method,
-                             struct blob_attr *msg)
-{
-    (void)obj; (void)method; (void)msg;
-
-    if (g_speedtest_running) {
-        blob_buf_init(&g_bbuf, 0);
-        blobmsg_add_u8 (&g_bbuf, "ok", 0);
-        blobmsg_add_u8 (&g_bbuf, "busy", 1);
-        blobmsg_add_u32(&g_bbuf, "started_at", g_speedtest_start_ts);
-        ubus_send_reply(ctx, req, g_bbuf.head);
-        return 0;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        blob_buf_init(&g_bbuf, 0);
-        blobmsg_add_u8 (&g_bbuf, "ok", 0);
-        blobmsg_add_string(&g_bbuf, "error", "fork failed");
-        ubus_send_reply(ctx, req, g_bbuf.head);
-        return 0;
-    }
-    if (pid == 0) {
-        freopen("/dev/null", "w", stdout);
-        freopen("/dev/null", "w", stderr);
-        execl("/etc/init.d/myhelper-watchdog",
-              "myhelper-watchdog", "speedtest", (char *)NULL);
-        _exit(127);
-    }
-
-    g_speedtest_running  = 1;
-    g_speedtest_start_ts = (uint32_t)time(NULL);
-
-    memset(&g_speedtest_proc, 0, sizeof(g_speedtest_proc));
-    g_speedtest_proc.cb  = speedtest_child_cb;
-    g_speedtest_proc.pid = pid;
-    uloop_process_add(&g_speedtest_proc);
-
-    event_push(EV_SPEEDTEST_START, "speedtest started (pid=%d)", pid);
-    MY_LOG(LOG_INFO, "speedtest started (pid=%d)", pid);
-
-    blob_buf_init(&g_bbuf, 0);
-    blobmsg_add_u8 (&g_bbuf, "ok", 1);
-    blobmsg_add_u8 (&g_bbuf, "busy", 0);
-    blobmsg_add_u32(&g_bbuf, "started_at", g_speedtest_start_ts);
-    ubus_send_reply(ctx, req, g_bbuf.head);
-    return 0;
-}
-
 static const struct ubus_method myhelper_methods[] = {
     UBUS_METHOD_NOARG("status",         ubus_status_cb),
     UBUS_METHOD_NOARG("force_recovery", ubus_force_recovery_cb),
