@@ -100,7 +100,10 @@ jobs:
             echo "ERROR: myhelper was not enabled after make defconfig"
             exit 1
           }
-          grep -E '^CONFIG_TARGET_DEVICE_.*rd16.*=y
+          grep -E '^CONFIG_TARGET_DEVICE_.*rd16.*=y$' .config || {
+            echo "ERROR: no enabled RD16 device in .config"
+            exit 1
+          }
 
       - name: Build kernel module toolchain (GCC 7.5.0)
         run: |
@@ -148,10 +151,6 @@ jobs:
             output/*.apk
           if-no-files-found: error
           retention-days: 30
- .config || {
-            echo "ERROR: no enabled RD16 device in .config"
-            exit 1
-          }
 
       - name: Build kernel module toolchain (GCC 7.5.0)
         run: |
