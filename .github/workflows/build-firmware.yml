@@ -2,7 +2,7 @@ name: Build RD16 firmware (prebuild + verify)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, fix/audit-bugfixes-2026-11 ]
   workflow_dispatch:
 
 jobs:
@@ -149,16 +149,22 @@ jobs:
           echo "CONFIG_PACKAGE_kmod-ifb=y"            >> .config
           echo "CONFIG_PACKAGE_kmod-nft-core=y"       >> .config
           echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"        >> .config
-          echo "CONFIG_PACKAGE_kmod-net-sched=y"      >> .config
-          echo "CONFIG_PACKAGE_kmod-sched-hfsc=y"     >> .config
-          echo "CONFIG_PACKAGE_kmod-act-mirred=y"     >> .config
-          echo "CONFIG_PACKAGE_kmod-act-gact=y"       >> .config
-          echo "CONFIG_PACKAGE_kmod-sch-ingress=y"    >> .config
+          echo "CONFIG_PACKAGE_kmod-sched-core=y"     >> .config
           echo "CONFIG_PACKAGE_zapret=y"               >> .config
           echo "CONFIG_PACKAGE_luci-app-zapret=y"      >> .config
           make defconfig
-          echo "=== Verify enabled packages ==="
-          grep -E '^CONFIG_PACKAGE_(myhelper|nftables|tc|kmod-sched-cake|kmod-ifb|kmod-tcp-bbr|kmod-nft-core)=y' .config || true
+          echo "=== Strictly verify required packages after defconfig ==="
+          for pkg in \
+            myhelper nftables tc ethtool \
+            kmod-sched-core kmod-sched-cake kmod-ifb kmod-nft-core kmod-tcp-bbr \
+            zapret luci-app-zapret; do
+            if ! grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "ERROR: required package is not enabled after defconfig: ${pkg}"
+              grep -E "^CONFIG_PACKAGE_${pkg}=" .config || true
+              exit 1
+            fi
+            echo "OK: ${pkg}"
+          done
 
       - name: Build kmod toolchain (GCC 7.5.0)
         run: |
