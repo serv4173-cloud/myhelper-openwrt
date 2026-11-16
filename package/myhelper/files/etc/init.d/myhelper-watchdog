@@ -160,6 +160,12 @@ resolve_mac_to_ip() {
 
 QOS_ROOT_STATE="/var/run/myhelper-qos-root"
 
+root_qdisc_is_default() {
+    local dev="$1" current
+    current=$(tc qdisc show dev "$dev" root 2>/dev/null)
+    echo "$current" | grep -Eq 'qdisc (noqueue|mq 0:|fq_codel 0:|pfifo_fast 0:) root'
+}
+
 remove_owned_root_qdisc() {
     local dev="$1" recorded_dev recorded_kind recorded_handle current
     [ -r "$QOS_ROOT_STATE" ] || return 0
@@ -342,7 +348,7 @@ apply_hfsc_game_boost() {
         "HFSC game_boost: total=${total_bw}kbit game=${game_bw}kbit pfifo=$pfifo_limit"
 
     remove_owned_root_qdisc "$dev"
-    if ! tc qdisc show dev "$dev" root 2>/dev/null | grep -q 'qdisc noqueue'; then
+    if ! root_qdisc_is_default "$dev"; then
         logger -t myhelper-watchdog "HFSC: root qdisc already exists; refusing to replace it"
         return 1
     fi
@@ -351,6 +357,8 @@ apply_hfsc_game_boost() {
         logger -t myhelper-watchdog "HFSC: root qdisc add failed"
         return 1
     fi
+    # Record ownership immediately so cleanup can remove a partially built tree.
+    echo "$dev hfsc 1:" > "$QOS_ROOT_STATE"
     if ! tc class add dev "$dev" parent 1: classid 1:1 hfsc \
         sc rate "${game_bw}kbit" ul rate "${game_bw}kbit"; then
         logger -t myhelper-watchdog "HFSC: class 1:1 (game) add failed"
@@ -554,7 +562,7 @@ apply_qos() {
                 "cake egress dev=$wan_dev rate=$bw_up preset=$qos_preset"
             remove_owned_root_qdisc "$wan_dev"
             # Do not replace an unrelated root qdisc (e.g. SQM).
-            if ! tc qdisc show dev "$wan_dev" root 2>/dev/null | grep -q 'qdisc noqueue'; then
+            if ! root_qdisc_is_default "$wan_dev"; then
                 logger -t myhelper-watchdog "cake egress: root qdisc already exists; refusing to replace it"
                 err=1
             else
