@@ -154,20 +154,21 @@ jobs:
           echo "CONFIG_PACKAGE_luci-app-zapret=y"      >> .config
           make defconfig
           echo "=== Strictly verify required packages after defconfig ==="
-          # nftables-nojson may resolve to m (a separately packaged IPK) in this
-          # vendor tree. Accept y or m for that package; require firmware inclusion
-          # for all other runtime packages checked below.
-          for pkg in myhelper tc ethtool \
+          # Include nftables userspace in the firmware image, not merely as a
+          # standalone IPK. nftables-nojson is the default variant providing
+          # the virtual package "nftables" required by myhelper.
+          sed -i 's/^CONFIG_PACKAGE_nftables-nojson=m$/CONFIG_PACKAGE_nftables-nojson=y/' .config
+          for pkg in \
+            myhelper nftables-nojson tc ethtool \
             kmod-sched-core kmod-sched-cake kmod-ifb kmod-nft-core kmod-tcp-bbr \
             zapret luci-app-zapret; do
             if ! grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
-              echo "ERROR: required package is not enabled after defconfig: ${pkg}"
+              echo "ERROR: required package is not enabled for firmware: ${pkg}"
               grep -E "^CONFIG_PACKAGE_${pkg}=" .config || true
               exit 1
             fi
             echo "OK: ${pkg}"
           done
-          if ! grep -Eq '^CONFIG_PACKAGE_nftables-nojson=(y|m)
 
       - name: Static checks for myhelper package
         run: |
