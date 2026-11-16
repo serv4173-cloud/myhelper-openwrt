@@ -68,9 +68,16 @@ jobs:
           set -e
           cd openwrt-src
           echo "=== Running prepare_feed.sh ==="
-          sh vendor_scripts/prepare_feed.sh || true
+          sh vendor_scripts/prepare_feed.sh
           echo "=== feeds.conf ==="
-          cat feeds.conf 2>/dev/null || cat feeds.conf.default
+          if [ -f feeds.conf ]; then
+            cat feeds.conf
+          elif [ -f feeds.conf.default ]; then
+            cat feeds.conf.default
+          else
+            echo "ERROR: prepare_feed.sh did not produce feeds.conf or feeds.conf.default"
+            exit 1
+          fi
 
       - name: Update feeds and enable myhelper
         run: |
@@ -89,7 +96,62 @@ jobs:
           grep -E '^CONFIG_TARGET_DEVICE' .config | head -5
 
           echo "=== Verify myhelper in config ==="
-          grep -E 'CONFIG_PACKAGE_myhelper' .config || echo "!!! myhelper NOT in .config !!!"
+          grep -qx 'CONFIG_PACKAGE_myhelper=y' .config || {
+            echo "ERROR: myhelper was not enabled after make defconfig"
+            exit 1
+          }
+          grep -E '^CONFIG_TARGET_DEVICE_.*rd16.*=y
+
+      - name: Build kernel module toolchain (GCC 7.5.0)
+        run: |
+          set -e
+          cd openwrt-src
+          echo "=== Running build_kmod_toolchain.sh ==="
+          bash vendor_scripts/build_kmod_toolchain.sh
+
+      - name: Build userspace toolchain (GCC 13.3.0)
+        run: |
+          set -e
+          cd openwrt-src
+          make toolchain/install V=s -j$(nproc)
+
+      - name: Build myhelper package
+        run: |
+          set -e
+          cd openwrt-src
+          make package/myhelper/compile V=s -j$(nproc)
+          echo "=== myhelper artifacts in bin/ ==="
+          find bin -name 'myhelper*' -exec ls -la {} \; || true
+
+      - name: Collect package
+        run: |
+          set -e
+          mkdir -p output
+          find openwrt-src/bin -name 'myhelper*.ipk' -exec cp -v {} output/ \; || true
+          find openwrt-src/bin -name 'myhelper*.apk' -exec cp -v {} output/ \; || true
+          echo "=== output contents ==="
+          ls -la output/
+          if [ -z "$(ls -A output)" ]; then
+            echo "ERROR: no myhelper package produced"
+            echo "=== diagnostic: bin tree ==="
+            find openwrt-src/bin -maxdepth 4 -type f | head -60
+            exit 1
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: myhelper-package
+          path: |
+            output/*.ipk
+            output/*.apk
+          if-no-files-found: error
+          retention-days: 30
+ .config || {
+            echo "ERROR: no enabled RD16 device in .config"
+            exit 1
+          }
 
       - name: Build kernel module toolchain (GCC 7.5.0)
         run: |
