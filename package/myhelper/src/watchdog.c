@@ -33,7 +33,6 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
-#include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -494,10 +493,11 @@ static int ping_host(const char *host, int timeout_sec, uint32_t *rtt_us_out)
             }
 
             /* Linux raw ICMP sockets deliver the IPv4 header too. */
-            if (n < (ssize_t)sizeof(struct ip)) continue;
+            /* Minimum IPv4 header is 20 bytes; IHL includes options. */
+            if (n < 20) continue;
             if ((reply[0] >> 4) != 4) continue;
             size_t ip_hlen = (size_t)(reply[0] & 0x0f) * 4;
-            if (ip_hlen < sizeof(struct ip) ||
+            if (ip_hlen < 20u ||
                 (size_t)n < ip_hlen + sizeof(struct icmphdr))
                 continue;
             if (from.sin_family != AF_INET ||
