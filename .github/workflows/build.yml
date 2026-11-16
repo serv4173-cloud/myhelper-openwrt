@@ -21,7 +21,7 @@ jobs:
             python3 python3-setuptools rsync subversion swig time unzip \
             zlib1g-dev file wget bc libelf-dev cpio aria2
 
-      - name: Clone RomikB source (branch openwrt-24-rd15)
+      - name: Clone RomikB source (branch openwrt-24-be3600)
         run: |
           set -e
           git clone --depth 1 --branch openwrt-24-be3600 \
@@ -52,22 +52,6 @@ jobs:
           
           echo "=== Custom sysauth.ut overlay injected successfully ==="
           ls -la openwrt-src/files/usr/share/ucode/luci/template/themes/argon/
-
-      - name: Fix Makefile tabs
-        run: |
-          set -e
-          FILE="openwrt-src/package/myhelper/Makefile"
-          echo "=== BEFORE ==="
-          grep -nP '^[ \t]' "$FILE" | head -20 | cat -A
-          echo "=== Fixing ==="
-          sed -i 's/^    /\t/' "$FILE"
-          echo "=== AFTER ==="
-          grep -nP '^\t' "$FILE" | head -20 | cat -A
-          if grep -qP '^ ' "$FILE"; then
-            echo "WARNING: leading spaces remain"
-          else
-            echo "OK: no leading spaces"
-          fi
 
       - name: Prepare config for RD16
         run: |
