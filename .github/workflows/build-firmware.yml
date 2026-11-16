@@ -116,11 +116,11 @@ jobs:
           else
             echo "Found target.mk at: $TARGET_MK"
             # Remove ONLY failing packages — KEEP Wi-Fi drivers.
+            # Only remove optional CLI front-ends known to fail in this build.
+            # Preserve vendor Wi-Fi supplicant, hostapd, firmware, CNSS and cfg80211
+            # components until dependency analysis proves a package is unnecessary.
             for pkg in \
-              qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor \
-              qca-hostap-vendor qca-cfg80211tool-vendor qca-cnss-daemon-vendor \
-              qca-firmware-vendor qca-ssdk-shell kmod-qca-nss-ecm-wifi-plugin \
-              yt-9215s-client ; do
+              qca-hostapd-cli qca-wpa-cli ; do
               sed -i "s|${pkg}||g" "$TARGET_MK"
             done
             echo "=== After removal ==="
