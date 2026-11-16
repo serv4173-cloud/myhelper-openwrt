@@ -150,11 +150,12 @@ jobs:
           echo "CONFIG_PACKAGE_kmod-nft-core=y"       >> .config
           echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"        >> .config
           echo "CONFIG_PACKAGE_kmod-sched-core=y"     >> .config
-          # zapret package symbols vary by feed/revision; don't append symbols
-          # before checking that feeds actually installed the corresponding Makefiles.
-          ./scripts/feeds list -i | grep -E '(^|[[:space:]])(zapret|luci-app-zapret)([[:space:]]|$)' || true
-          echo "CONFIG_PACKAGE_zapret=y"               >> .config
-          echo "CONFIG_PACKAGE_luci-app-zapret=y"      >> .config
+          # This branch's installed feed provides zapret2/luci-app-zapret2,
+          # not zapret/luci-app-zapret. "feeds list -i" is not supported by
+          # this tree's feeds script; use search to show the actual package names.
+          ./scripts/feeds search zapret2 || true
+          echo "CONFIG_PACKAGE_zapret2=y"               >> .config
+          echo "CONFIG_PACKAGE_luci-app-zapret2=y"      >> .config
           make defconfig
           echo "=== Strictly verify required packages after defconfig ==="
           # Include nftables userspace in the firmware image, not merely as a
@@ -171,11 +172,14 @@ jobs:
             fi
             echo "OK: ${pkg}"
           done
-          # zapret is a requested feature: fail with feed diagnostics instead
-          # of silently producing firmware without it.
-          for pkg in zapret luci-app-zapret; do
+          # Include the actual package names exposed by the zapret2 feed.
+          # Keep both packages in the firmware image rather than as IPKs only.
+          sed -i \
+            -e 's/^CONFIG_PACKAGE_zapret2=m$/CONFIG_PACKAGE_zapret2=y/' \
+            -e 's/^CONFIG_PACKAGE_luci-app-zapret2=m$/CONFIG_PACKAGE_luci-app-zapret2=y/' .config
+          for pkg in zapret2 luci-app-zapret2; do
             if ! grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
-              echo "ERROR: required package ${pkg} is unavailable or not selectable after defconfig"
+              echo "ERROR: required package ${pkg} is unavailable or not selectable for firmware"
               echo "=== Feed search ==="
               ./scripts/feeds search "${pkg}" || true
               echo "=== Matching package definitions ==="
