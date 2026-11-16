@@ -177,7 +177,7 @@ jobs:
             echo "ERROR: invalid split scheduler package dependency remains"
             exit 1
           fi
-          grep -q "grep -oE '\[0-9\]+(\[.\]\[0-9\]+)?'" openwrt-src/package/myhelper/files/etc/init.d/myhelper-watchdog || {
+          grep -Fq "grep -oE '[0-9]+([.][0-9]+)?'" openwrt-src/package/myhelper/files/etc/init.d/myhelper-watchdog || {
             echo "ERROR: speedtest numeric parser does not accept integers and decimals"
             exit 1
           }
