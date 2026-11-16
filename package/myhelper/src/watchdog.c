@@ -1000,8 +1000,11 @@ static void speedtest_child_cb(struct uloop_process *p, int ret)
     g_speedtest_running = 0;
     g_speedtest_last_ts = (uint32_t)time(NULL);
     g_speedtest_last_rc = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) ? 0 : -1;
-    snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg),
-             g_speedtest_last_rc == 0 ? "completed" : "failed (status=0x%x)", ret);
+    if (g_speedtest_last_rc == 0)
+        snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg), "completed");
+    else
+        snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg),
+                 "failed (status=0x%x)", ret);
     event_push(g_speedtest_last_rc == 0 ? EV_SPEEDTEST_OK : EV_SPEEDTEST_FAIL,
                "speedtest %s (status=0x%x)",
                g_speedtest_last_rc == 0 ? "completed" : "failed", ret);
