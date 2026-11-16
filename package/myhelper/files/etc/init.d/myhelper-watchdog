@@ -645,12 +645,17 @@ speedtest() {
     fi
 
     OUT=$(timeout 120 speedtest-netperf -H netperf.bufferbloat.net 2>&1)
+    speedtest_rc=$?
+    if [ "$speedtest_rc" -ne 0 ]; then
+        logger -t myhelper-watchdog "speedtest failed (exit=$speedtest_rc): $OUT"
+        return "$speedtest_rc"
+    fi
 
     DL=$(echo "$OUT" | grep -iE 'download' | grep -oE '[0-9]+\.[0-9]+' | head -1)
     UL=$(echo "$OUT" | grep -iE 'upload'   | grep -oE '[0-9]+\.[0-9]+' | head -1)
 
-    [ -z "$DL" ] && DL=0
-    [ -z "$UL" ] && UL=0
+    case "$DL" in ''|*[!0-9.]*|*.*.*) logger -t myhelper-watchdog "speedtest failed: could not parse download result"; return 1 ;; esac
+    case "$UL" in ''|*[!0-9.]*|*.*.*) logger -t myhelper-watchdog "speedtest failed: could not parse upload result"; return 1 ;; esac
 
     DL_KBIT=$(echo "$DL" | awk '{printf "%d", $1 * 1000}')
     UL_KBIT=$(echo "$UL" | awk '{printf "%d", $1 * 1000}')
