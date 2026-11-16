@@ -187,7 +187,7 @@ remove_owned_ingress_filter() {
     local dev="$1" filters
     filters=$(tc filter show dev "$dev" parent ffff: 2>/dev/null)
     # We use a dedicated preference and IFB target. Never delete a foreign filter.
-    if echo "$filters" | grep -q 'mirred.*redirect.*ifb-myhelper'; then
+    if echo "$filters" | grep -qi 'mirred.*redirect.*ifb-myhelper'; then
         tc filter del dev "$dev" parent ffff: protocol all pref 49152 2>/dev/null
     fi
 }
