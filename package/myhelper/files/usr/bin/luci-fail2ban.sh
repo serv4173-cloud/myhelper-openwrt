@@ -1,7 +1,18 @@
 #!/bin/sh
-nft add table inet fw4 2>/dev/null
-nft add set inet fw4 luci_bruteforce { type ipv4_addr\; flags dynamic,timeout\; timeout 5m\; } 2>/dev/null
-nft add rule inet fw4 input ip saddr @luci_bruteforce counter drop 2>/dev/null
+# Use the fw4 table managed by firewall4; do not create/delete the table itself.
+# The set and rule are named so startup is safe across procd restarts.
+nft list table inet fw4 >/dev/null 2>&1 || {
+    logger -t luci-fail2ban "firewall4 table inet fw4 is not available"
+    exit 1
+}
+
+if ! nft list set inet fw4 luci_bruteforce >/dev/null 2>&1; then
+    nft add set inet fw4 luci_bruteforce { type ipv4_addr\; flags dynamic,timeout\; timeout 5m\; } || exit 1
+fi
+
+if ! nft -a list chain inet fw4 input 2>/dev/null | grep -q 'ip saddr @luci_bruteforce.*drop'; then
+    nft add rule inet fw4 input ip saddr @luci_bruteforce counter drop || exit 1
+fi
 
 logger -t luci-fail2ban "Started monitoring LuCI failed logins (5 fails / 60s -> block 5m)"
 
@@ -11,7 +22,7 @@ logread -f | while read -r line; do
             IP=$(echo "$line" | sed -n 's/.*from \([0-9a-f:.]*\).*/\1/p')
             if [ -n "$IP" ]; then
                 NOW=$(date +%s)
-                FILE="/tmp/luci_fail_$(echo $IP | tr ':' '_')"
+                FILE="/tmp/luci_fail_$(echo "$IP" | tr '.' '_')"
                 
                 if [ -f "$FILE" ]; then
                     read COUNT OLD_TIME < "$FILE"
