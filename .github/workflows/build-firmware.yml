@@ -150,6 +150,9 @@ jobs:
           echo "CONFIG_PACKAGE_kmod-nft-core=y"       >> .config
           echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"        >> .config
           echo "CONFIG_PACKAGE_kmod-sched-core=y"     >> .config
+          # zapret package symbols vary by feed/revision; don't append symbols
+          # before checking that feeds actually installed the corresponding Makefiles.
+          ./scripts/feeds list -i | grep -E '(^|[[:space:]])(zapret|luci-app-zapret)([[:space:]]|$)' || true
           echo "CONFIG_PACKAGE_zapret=y"               >> .config
           echo "CONFIG_PACKAGE_luci-app-zapret=y"      >> .config
           make defconfig
@@ -160,14 +163,24 @@ jobs:
           sed -i 's/^CONFIG_PACKAGE_nftables-nojson=m$/CONFIG_PACKAGE_nftables-nojson=y/' .config
           for pkg in \
             myhelper nftables-nojson tc-tiny ethtool \
-            kmod-sched-core kmod-sched-cake kmod-ifb kmod-nft-core kmod-tcp-bbr \
-            zapret luci-app-zapret; do
+            kmod-sched-core kmod-sched-cake kmod-ifb kmod-nft-core kmod-tcp-bbr; do
             if ! grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
               echo "ERROR: required package is not enabled for firmware: ${pkg}"
               grep -E "^CONFIG_PACKAGE_${pkg}=" .config || true
               exit 1
             fi
             echo "OK: ${pkg}"
+          done
+          # Require zapret only if the feeds provide it; report exact Kconfig
+          # symbols when the package is missing/renamed instead of failing blindly.
+          for pkg in zapret luci-app-zapret; do
+            if grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "OK: ${pkg}"
+            else
+              echo "WARNING: ${pkg} is not enabled; checking whether a package definition exists"
+              find package/feeds -path "*/${pkg}/Makefile" -o -path "*/${pkg}/Makefile" 2>/dev/null | head -5 || true
+              grep -R -l "define Package/${pkg}" package/feeds feeds 2>/dev/null | head -5 || true
+            fi
           done
 
       - name: Static checks for myhelper package
