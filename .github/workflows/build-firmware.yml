@@ -94,7 +94,10 @@ jobs:
           make defconfig
 
           echo "=== Active RD16 devices ==="
-          if ! grep -E '^CONFIG_TARGET_DEVICE_.*rd16.*=y
+          if ! grep -E '^CONFIG_TARGET_DEVICE_.*rd16.*=y$' .config; then
+            echo "ERROR: no enabled RD16 device after make defconfig"
+            exit 1
+          fi
 
       # Do not replace the vendor supplicant/hostapd with empty packages:
       # those may be required at runtime for RD16 Wi-Fi. Missing sources should
@@ -274,10 +277,6 @@ jobs:
           path: output/*
           if-no-files-found: error
           retention-days: 30
- .config; then
-            echo "ERROR: no enabled RD16 device after make defconfig"
-            exit 1
-          fi
 
       # Do not replace the vendor supplicant/hostapd with empty packages:
       # those may be required at runtime for RD16 Wi-Fi. Missing sources should
