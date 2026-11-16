@@ -792,7 +792,26 @@ static int ubus_speedtest_cb(struct ubus_context *ctx, struct ubus_object *obj,
     memset(&g_speedtest_proc, 0, sizeof(g_speedtest_proc));
     g_speedtest_proc.cb  = speedtest_child_cb;
     g_speedtest_proc.pid = pid;
-    uloop_process_add(&g_speedtest_proc);
+    if (uloop_process_add(&g_speedtest_proc) != 0) {
+        int saved_errno = errno;
+        MY_LOG(LOG_ERR, "speedtest: uloop_process_add failed: %s",
+               strerror(saved_errno));
+        (void)kill(pid, SIGTERM);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        g_speedtest_proc.pid = 0;
+        g_speedtest_running = 0;
+        g_speedtest_last_ts = (uint32_t)time(NULL);
+        g_speedtest_last_rc = -1;
+        snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg),
+                 "process registration failed");
+        event_push(EV_SPEEDTEST_FAIL, "speedtest process registration failed");
+
+        blob_buf_init(&g_bbuf, 0);
+        blobmsg_add_u8(&g_bbuf, "ok", 0);
+        blobmsg_add_string(&g_bbuf, "error", "process registration failed");
+        ubus_send_reply(ctx, req, g_bbuf.head);
+        return 0;
+    }
 
     event_push(EV_SPEEDTEST_START, "speedtest started (pid=%d)", pid);
     MY_LOG(LOG_INFO, "speedtest started (pid=%d)", pid);
