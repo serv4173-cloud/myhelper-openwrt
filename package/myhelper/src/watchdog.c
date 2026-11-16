@@ -387,10 +387,31 @@ static void history_save(void)
 
     char *json = blobmsg_format_json(b.head, true);
     if (json) {
-        FILE *f = fopen(HISTORY_FILE, "w");
-        if (f) {
-            if (fputs(json, f) >= 0) fflush(f);
-            fclose(f);
+        char tmp_path[sizeof(HISTORY_FILE) + 16];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", HISTORY_FILE);
+        int fd = mkstemp(tmp_path);
+        if (fd >= 0) {
+            FILE *f = fdopen(fd, "w");
+            if (f) {
+                int ok = (fputs(json, f) >= 0 && fflush(f) == 0 &&
+                          fsync(fileno(f)) == 0);
+                if (fclose(f) != 0) ok = 0;
+                if (ok && rename(tmp_path, HISTORY_FILE) == 0) {
+                    /* Atomic replacement: readers see either old or new JSON. */
+                } else {
+                    unlink(tmp_path);
+                    MY_LOG(LOG_ERR, "history_save: write/rename failed: %s",
+                           strerror(errno));
+                }
+            } else {
+                close(fd);
+                unlink(tmp_path);
+                MY_LOG(LOG_ERR, "history_save: fdopen failed: %s",
+                       strerror(errno));
+            }
+        } else {
+            MY_LOG(LOG_ERR, "history_save: mkstemp failed: %s",
+                   strerror(errno));
         }
         free(json);
     }
