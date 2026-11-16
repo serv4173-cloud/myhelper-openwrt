@@ -57,13 +57,6 @@ jobs:
           cp -r package/myhelper/* openwrt-src/package/myhelper/
           ls -la openwrt-src/package/myhelper/
 
-      - name: Fix Makefile tabs
-        run: |
-          set -e
-          FILE="openwrt-src/package/myhelper/Makefile"
-          sed -i 's/^    /\t/' "$FILE"
-          grep -nP '^\t' "$FILE" | head -10 | cat -A
-
       - name: Extract vendor feed + kernel from stock firmware
         run: |
           set -e
@@ -198,7 +191,6 @@ jobs:
           echo "CONFIG_PACKAGE_kmod-nft-core=y"       >> .config
           echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"        >> .config
           echo "CONFIG_PACKAGE_kmod-net-sched=y"      >> .config
-          echo "CONFIG_PACKAGE_kmod-ifb=y"            >> .config
           echo "CONFIG_PACKAGE_kmod-sched-hfsc=y"     >> .config
           echo "CONFIG_PACKAGE_kmod-act-mirred=y"     >> .config
           echo "CONFIG_PACKAGE_kmod-act-gact=y"       >> .config
