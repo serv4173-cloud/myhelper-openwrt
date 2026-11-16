@@ -299,13 +299,6 @@ jobs:
           path: output/*
           if-no-files-found: error
           retention-days: 30
- .config; then
-            echo "ERROR: nftables-nojson is not selected after defconfig"
-            grep -E '^CONFIG_PACKAGE_nftables(-nojson|-json)?=' .config || true
-            exit 1
-          fi
-          echo "OK: nftables-nojson ($(grep -E '^CONFIG_PACKAGE_nftables-nojson=' .config | cut -d= -f2))"
-
       - name: Static checks for myhelper package
         run: |
           set -eu
