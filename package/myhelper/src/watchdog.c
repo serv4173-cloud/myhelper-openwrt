@@ -33,6 +33,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -439,6 +440,7 @@ static unsigned short icmp_checksum(const void *buf, int len)
 static int ping_host(const char *host, int timeout_sec, uint32_t *rtt_us_out)
 {
     if (rtt_us_out) *rtt_us_out = 0;
+    if (timeout_sec <= 0) return 0;
 
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -450,34 +452,73 @@ static int ping_host(const char *host, int timeout_sec, uint32_t *rtt_us_out)
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (sock < 0) { freeaddrinfo(res); return 0; }
 
-    struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in target = *(struct sockaddr_in *)res->ai_addr;
+    freeaddrinfo(res);
 
     unsigned char pkt[64] = {0};
     struct icmphdr *icmp = (struct icmphdr *)pkt;
+    const uint16_t ping_id = htons((uint16_t)(getpid() & 0xffff));
+    const uint16_t ping_seq = htons(1);
     icmp->type             = ICMP_ECHO;
     icmp->code             = 0;
-    icmp->un.echo.id       = htons((uint16_t)(getpid() & 0xffff));
-    icmp->un.echo.sequence = htons(1);
+    icmp->un.echo.id       = ping_id;
+    icmp->un.echo.sequence = ping_seq;
     icmp->checksum         = icmp_checksum(pkt, sizeof(pkt));
 
-    struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
-    int ok = 0;
     uint64_t t0 = now_us();
+    uint64_t deadline = t0 + (uint64_t)timeout_sec * 1000000ull;
+    int ok = 0;
+
     if (sendto(sock, pkt, sizeof(pkt), 0,
-               (struct sockaddr *)addr, sizeof(*addr)) > 0) {
-        unsigned char reply[1024];
-        struct sockaddr_in from;
-        socklen_t fromlen = sizeof(from);
-        if (recvfrom(sock, reply, sizeof(reply), 0,
-                     (struct sockaddr *)&from, &fromlen) > 0) {
+               (struct sockaddr *)&target, sizeof(target)) > 0) {
+        for (;;) {
+            uint64_t now = now_us();
+            if (now >= deadline) break;
+
+            uint64_t remaining = deadline - now;
+            struct timeval tv = {
+                .tv_sec = (time_t)(remaining / 1000000ull),
+                .tv_usec = (suseconds_t)(remaining % 1000000ull)
+            };
+            if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+                break;
+
+            unsigned char reply[2048];
+            struct sockaddr_in from;
+            socklen_t fromlen = sizeof(from);
+            ssize_t n = recvfrom(sock, reply, sizeof(reply), 0,
+                                 (struct sockaddr *)&from, &fromlen);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+
+            /* Linux raw ICMP sockets deliver the IPv4 header too. */
+            if (n < (ssize_t)sizeof(struct ip)) continue;
+            if ((reply[0] >> 4) != 4) continue;
+            size_t ip_hlen = (size_t)(reply[0] & 0x0f) * 4;
+            if (ip_hlen < sizeof(struct ip) ||
+                (size_t)n < ip_hlen + sizeof(struct icmphdr))
+                continue;
+            if (from.sin_family != AF_INET ||
+                from.sin_addr.s_addr != target.sin_addr.s_addr)
+                continue;
+
+            const struct icmphdr *resp =
+                (const struct icmphdr *)(reply + ip_hlen);
+            if (resp->type != ICMP_ECHOREPLY || resp->code != 0 ||
+                resp->un.echo.id != ping_id ||
+                resp->un.echo.sequence != ping_seq)
+                continue;
+
             uint64_t t1 = now_us();
-            ok = 1;
             if (rtt_us_out) *rtt_us_out = (uint32_t)(t1 - t0);
+            ok = 1;
+            break;
         }
     }
+
     close(sock);
-    freeaddrinfo(res);
     return ok;
 }
 
