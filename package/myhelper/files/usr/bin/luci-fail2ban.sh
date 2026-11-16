@@ -20,12 +20,16 @@ logread -f | while read -r line; do
     case "$line" in
         *"luci: failed login"*)
             IP=$(echo "$line" | sed -n 's/.*from \([0-9a-f:.]*\).*/\1/p')
-            # The nft set is IPv4-only. Reject IPv6 and malformed tokens.
-            case "$IP" in
-                *[!0-9.]*|*.*.*.*.*) continue ;;
-                *.*.*.*) ;;
-                *) continue ;;
-            esac
+            # The nft set is IPv4-only. Validate four decimal octets, 0..255.
+            echo "$IP" | awk -F. '
+                NF != 4 { exit 1 }
+                {
+                    for (i = 1; i <= 4; i++) {
+                        if ($i !~ /^[0-9]+$/ || length($i) > 3 || $i + 0 > 255)
+                            exit 1
+                    }
+                }
+            ' || continue
             if [ -n "$IP" ]; then
                 NOW=$(date +%s)
                 FILE="/tmp/luci_fail_$(echo "$IP" | tr '.' '_')"
@@ -44,8 +48,11 @@ logread -f | while read -r line; do
                 echo "$COUNT $NOW" > "$FILE"
                 
                 if [ "$COUNT" -ge 5 ]; then
-                    nft add element inet fw4 luci_bruteforce { "$IP" timeout 300s } 2>/dev/null
-                    logger -t luci-fail2ban "Blocked $IP for 5m (5 fails in 60s)"
+                    if nft add element inet fw4 luci_bruteforce { "$IP" timeout 300s } 2>/dev/null; then
+                        logger -t luci-fail2ban "Blocked $IP for 5m (5 fails in 60s)"
+                    else
+                        logger -t luci-fail2ban "ERROR: failed to block $IP in nftables"
+                    fi
                     rm -f "$FILE"
                 fi
             fi
