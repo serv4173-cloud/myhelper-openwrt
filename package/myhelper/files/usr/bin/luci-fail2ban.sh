@@ -20,6 +20,12 @@ logread -f | while read -r line; do
     case "$line" in
         *"luci: failed login"*)
             IP=$(echo "$line" | sed -n 's/.*from \([0-9a-f:.]*\).*/\1/p')
+            # The nft set is IPv4-only. Reject IPv6 and malformed tokens.
+            case "$IP" in
+                *[!0-9.]*|*.*.*.*.*) continue ;;
+                *.*.*.*) ;;
+                *) continue ;;
+            esac
             if [ -n "$IP" ]; then
                 NOW=$(date +%s)
                 FILE="/tmp/luci_fail_$(echo "$IP" | tr '.' '_')"
