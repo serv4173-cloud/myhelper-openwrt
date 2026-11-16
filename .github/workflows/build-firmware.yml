@@ -142,7 +142,7 @@ jobs:
           set -e
           cd openwrt-src
           echo "CONFIG_PACKAGE_myhelper=y"             >> .config
-          echo "CONFIG_PACKAGE_nftables=y"            >> .config
+          echo "CONFIG_PACKAGE_nftables-nojson=y"            >> .config
           echo "CONFIG_PACKAGE_tc=y"                  >> .config
           echo "CONFIG_PACKAGE_ethtool=y"             >> .config
           echo "CONFIG_PACKAGE_kmod-sched-cake=y"     >> .config
@@ -155,7 +155,7 @@ jobs:
           make defconfig
           echo "=== Strictly verify required packages after defconfig ==="
           for pkg in \
-            myhelper nftables tc ethtool \
+            myhelper nftables-nojson tc ethtool \
             kmod-sched-core kmod-sched-cake kmod-ifb kmod-nft-core kmod-tcp-bbr \
             zapret luci-app-zapret; do
             if ! grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
