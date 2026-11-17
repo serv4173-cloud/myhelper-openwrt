@@ -20,7 +20,14 @@ jobs:
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
             python3 python3-setuptools python3-pip rsync subversion swig time \
             unzip zlib1g-dev file wget bc libelf-dev cpio aria2 squashfs-tools
-          pip install --quiet ubi_reader pyelftools capstone
+          set -e
+          TOOL_VENV="$RUNNER_TEMP/firmware-tools"
+          python3 -m venv "$TOOL_VENV"
+          "$TOOL_VENV/bin/python" -m pip install --upgrade pip
+          "$TOOL_VENV/bin/python" -m pip install ubi_reader pyelftools capstone
+          echo "$TOOL_VENV/bin" >> "$GITHUB_PATH"
+          "$TOOL_VENV/bin/ubireader_extract_images" --help >/dev/null
+          echo "ubi_reader installed: $TOOL_VENV/bin/ubireader_extract_images"
 
       - name: Verify tools
         run: |
@@ -89,8 +96,10 @@ jobs:
           test -s .config || { echo "ERROR: prepare_config.sh did not create .config"; exit 1; }
 
           # Оставляем ТОЛЬКО prebuild (убираем QSDK, если они есть в конфиге)
-          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config 2>/dev/null || true
-          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk-podkop/d' .config 2>/dev/null || true
+          # The actual symbols include the subtarget component
+          # TARGET_ipq53xx_ipq53xx_32; match only the intended profiles.
+          sed -i '/^CONFIG_TARGET_DEVICE_ipq53xx_ipq53xx_32_DEVICE_xiaomi-rd16-qsdk=y$/d' .config
+          sed -i '/^CONFIG_TARGET_DEVICE_ipq53xx_ipq53xx_32_DEVICE_xiaomi-rd16-qsdk-podkop=y$/d' .config
 
           make defconfig
 
