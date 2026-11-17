@@ -35,15 +35,15 @@ jobs:
           bash -n scripts/ppe/collect-ppe-module-info.sh
           bash -n scripts/ppe/scan-ppe-sources.sh
 
-      - name: Check help and invalid arguments
+      - name: Check argument validation
         shell: bash
         run: |
           set -euo pipefail
-          scripts/ppe/collect-ppe-module-info.sh --help >/tmp/module-help.txt 2>&1 && {
-            echo "Expected usage error for --help argument; this is not a supported flag."
-            exit 1
-          } || true
-          scripts/ppe/scan-ppe-sources.sh >/tmp/scan-help.txt 2>&1 && {
-            echo "Expected usage error when no arguments are supplied."
-            exit 1
-          } || test "$?" -eq 2
+          set +e
+          bash scripts/ppe/collect-ppe-module-info.sh >/tmp/module-help.txt 2>&1
+          module_status=$?
+          bash scripts/ppe/scan-ppe-sources.sh >/tmp/scan-help.txt 2>&1
+          scan_status=$?
+          set -e
+          test "$module_status" -eq 2
+          test "$scan_status" -eq 2
