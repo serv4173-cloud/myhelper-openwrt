@@ -142,24 +142,31 @@ jobs:
           cd openwrt-src
           make toolchain/install V=s -j$(nproc)
 
-      - name: Prepare target kernel configuration
+      - name: Build target kernel and prepare kernel configuration
         run: |
           set -e
           cd openwrt-src
-          # myhelper declares kmod-* runtime dependencies; prepare the target
-          # Linux tree before dependency checks use kernel build stamps.
-          echo "=== Prepare target Linux tree/config ==="
-          make target/linux/prepare V=s -j$(nproc)
-          echo "=== Locate generated kernel configs ==="
-          find build_dir -path '*/linux-*/.config' -type f -print
-          KERNEL_CONFIG="$(find build_dir -path '*/linux-ipq53xx_ipq53xx_32/linux-5.4.213/.config' -type f -print -quit)"
+          # target/linux/prepare only unpacks and patches the kernel source;
+          # it does not generate the target kernel .config. The toolchain's
+          # linux-5.4.213/.config is a different config and must not be used.
+          # Compile the target once so OpenWrt runs kernel_menuconfig/oldconfig
+          # and produces the real target kernel config needed by kmod deps.
+          echo "=== Build target Linux kernel and modules ==="
+          make target/linux/compile V=s -j$(nproc)
+          echo "=== Locate target kernel config (not toolchain config) ==="
+          find build_dir -path '*/linux-ipq53xx_ipq53xx_32/linux-*/.config' -type f -print
+          KERNEL_CONFIG="$(find build_dir -path '*/linux-ipq53xx_ipq53xx_32/linux-*/.config' -type f -print -quit)"
           if [ -z "$KERNEL_CONFIG" ]; then
-            echo "ERROR: target/linux/prepare did not create the expected IPQ53xx 5.4.213 kernel .config"
+            echo "ERROR: target/linux/compile did not create an IPQ53xx target kernel .config"
             echo "=== Relevant build directories ==="
-            find build_dir -maxdepth 6 -type d -name 'linux-*' -print | head -80
+            find build_dir -maxdepth 7 -type d -name 'linux-*' -print | head -100
             exit 1
           fi
-          echo "Kernel config prepared: $KERNEL_CONFIG"
+          grep -q '^CONFIG_' "$KERNEL_CONFIG" || {
+            echo "ERROR: target kernel .config exists but is empty/invalid: $KERNEL_CONFIG"
+            exit 1
+          }
+          echo "Target kernel config prepared: $KERNEL_CONFIG"
 
       - name: Build myhelper package
         run: |
