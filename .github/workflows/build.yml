@@ -40,7 +40,7 @@ jobs:
           cd openwrt-src
           STOCK_URL="https://github.com/serv4173-cloud/myhelper-openwrt/releases/download/stock-1.0.31/miwifi_rd16_firmware_87da2_1.0.31.bin"
           echo "Downloading stock RD16 firmware: $STOCK_URL"
-          curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 600 \\
+          curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 600 \
             -o "miwifi_rd16_firmware_87da2_1.0.31.bin" "$STOCK_URL"
           test -s "miwifi_rd16_firmware_87da2_1.0.31.bin"
           echo "Downloaded firmware size: $(stat -c%s "miwifi_rd16_firmware_87da2_1.0.31.bin") bytes"
