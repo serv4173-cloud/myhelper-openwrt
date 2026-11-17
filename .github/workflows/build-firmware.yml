@@ -241,7 +241,8 @@ jobs:
               echo "OK: kernel contains NSS references"
             fi
           else
-            echo "WARNING: kernel Image not found in build_dir"
+            echo "ERROR: compiled kernel Image not found in build_dir"
+            exit 1
           fi
 
           echo "=== Locating compiled DTB ==="
