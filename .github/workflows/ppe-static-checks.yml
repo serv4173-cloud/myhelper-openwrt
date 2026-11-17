@@ -1,0 +1,49 @@
+name: PPE research static checks
+
+on:
+  push:
+    branches:
+      - ppe
+    paths:
+      - "scripts/ppe/**"
+      - "docs/ppe/**"
+      - ".github/workflows/ppe-static-checks.yml"
+  pull_request:
+    branches:
+      - ppe
+    paths:
+      - "scripts/ppe/**"
+      - "docs/ppe/**"
+      - ".github/workflows/ppe-static-checks.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check Bash syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/ppe/collect-ppe-module-info.sh
+          bash -n scripts/ppe/scan-ppe-sources.sh
+
+      - name: Check help and invalid arguments
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/ppe/collect-ppe-module-info.sh --help >/tmp/module-help.txt 2>&1 && {
+            echo "Expected usage error for --help argument; this is not a supported flag."
+            exit 1
+          } || true
+          scripts/ppe/scan-ppe-sources.sh >/tmp/scan-help.txt 2>&1 && {
+            echo "Expected usage error when no arguments are supplied."
+            exit 1
+          } || test "$?" -eq 2
