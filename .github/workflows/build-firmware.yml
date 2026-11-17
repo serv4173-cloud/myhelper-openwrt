@@ -63,8 +63,10 @@ jobs:
           cd openwrt-src
           chmod +x vendor_scripts/*.sh
           
-          echo "=== Running prepare_feed.sh rd16 ==="
-          sh vendor_scripts/prepare_feed.sh rd16
+          FW_FILE="miwifi_rd16_firmware_87da2_1.0.31.bin"
+          test -s "$FW_FILE" || { echo "ERROR: missing stock RD16 firmware: $FW_FILE"; exit 1; }
+          echo "=== Running prepare_feed.sh for RD16 ==="
+          sh vendor_scripts/prepare_feed.sh rd16 "$FW_FILE"
 
           echo "=== Checking target/linux/ipq53xx/ structure ==="
           ls -la target/linux/ipq53xx/
