@@ -14,6 +14,23 @@ Target hardware: Xiaomi BE3600 RD16 / Qualcomm IPQ5332. Goals:
 - `scripts/ppe/scan-ppe-sources.sh`: search a supplied source tree for PPE/offload references.
 - `.github/workflows/ppe-static-checks.yml`: shell syntax checks for these research scripts.
 
+## Run locally
+
+The scripts are stored as text files, so invoke them with Bash (no executable-bit setup required):
+
+```bash
+# Scan a kernel/OpenWrt source tree:
+bash scripts/ppe/scan-ppe-sources.sh /path/to/kernel-or-openwrt ./ppe-source-scan.txt
+
+# Inventory modules in an extracted stock rootfs:
+bash scripts/ppe/collect-ppe-module-info.sh /path/to/extracted-rootfs ./ppe-inventory
+
+# Or pass the directory that directly contains .ko / .ko.xz / .ko.zst files:
+bash scripts/ppe/collect-ppe-module-info.sh /path/to/modules ./ppe-inventory
+```
+
+The scripts are read-only. They produce reports locally; they do not upload firmware dumps, load modules, change router settings, flash firmware, or recover original source code from binaries.
+
 ## Required evidence before implementation
 
 1. **Exact firmware dump**: record source, partition, byte size and SHA-256. Keep proprietary dumps private; do not commit them to this repository.
