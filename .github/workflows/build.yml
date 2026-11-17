@@ -2,7 +2,7 @@ name: Build myhelper for Xiaomi BE3600 RD16
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, fix/audit-bugfixes-2026-11 ]
   workflow_dispatch:
 
 jobs:
