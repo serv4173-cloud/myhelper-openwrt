@@ -142,6 +142,25 @@ jobs:
           cd openwrt-src
           make toolchain/install V=s -j$(nproc)
 
+      - name: Prepare target kernel configuration
+        run: |
+          set -e
+          cd openwrt-src
+          # myhelper declares kmod-* runtime dependencies; prepare the target
+          # Linux tree before dependency checks use kernel build stamps.
+          echo "=== Prepare target Linux tree/config ==="
+          make target/linux/prepare V=s -j$(nproc)
+          echo "=== Locate generated kernel configs ==="
+          find build_dir -path '*/linux-*/.config' -type f -print
+          KERNEL_CONFIG="$(find build_dir -path '*/linux-ipq53xx_ipq53xx_32/linux-5.4.213/.config' -type f -print -quit)"
+          if [ -z "$KERNEL_CONFIG" ]; then
+            echo "ERROR: target/linux/prepare did not create the expected IPQ53xx 5.4.213 kernel .config"
+            echo "=== Relevant build directories ==="
+            find build_dir -maxdepth 6 -type d -name 'linux-*' -print | head -80
+            exit 1
+          fi
+          echo "Kernel config prepared: $KERNEL_CONFIG"
+
       - name: Build myhelper package
         run: |
           set -e
