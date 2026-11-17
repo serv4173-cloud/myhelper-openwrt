@@ -34,6 +34,7 @@ jobs:
           set -euo pipefail
           bash -n scripts/ppe/collect-ppe-module-info.sh
           bash -n scripts/ppe/scan-ppe-sources.sh
+          bash -n scripts/ppe/extract-stock-firmware.sh
 
       - name: Check argument validation
         shell: bash
@@ -44,6 +45,9 @@ jobs:
           module_status=$?
           bash scripts/ppe/scan-ppe-sources.sh >/tmp/scan-help.txt 2>&1
           scan_status=$?
+          bash scripts/ppe/extract-stock-firmware.sh >/tmp/extract-help.txt 2>&1
+          extract_status=$?
           set -e
           test "$module_status" -eq 2
           test "$scan_status" -eq 2
+          test "$extract_status" -eq 2
