@@ -10,26 +10,38 @@ Target hardware: Xiaomi BE3600 RD16 / Qualcomm IPQ5332. Goals:
 
 ## What is included
 
+- `scripts/ppe/extract-stock-firmware.sh`: extract UBI/SquashFS from a local stock firmware dump and collect modules and `/lib/firmware`.
 - `scripts/ppe/collect-ppe-module-info.sh`: inventory module files and metadata from an extracted root filesystem or module directory.
 - `scripts/ppe/scan-ppe-sources.sh`: search a supplied source tree for PPE/offload references.
-- `.github/workflows/ppe-static-checks.yml`: shell syntax checks for these research scripts.
+- `.github/workflows/ppe-static-checks.yml`: shell syntax and argument checks.
 
 ## Run locally
 
-The scripts are stored as text files, so invoke them with Bash (no executable-bit setup required):
+Use Linux or WSL. Install `binwalk`, `file`, `squashfs-tools`, `xz-utils`, `zstd`, and `p7zip` using your distribution's package manager. Then install UBI Reader in a Python virtual environment:
 
 ```bash
-# Scan a kernel/OpenWrt source tree:
-bash scripts/ppe/scan-ppe-sources.sh /path/to/kernel-or-openwrt ./ppe-source-scan.txt
-
-# Inventory modules in an extracted stock rootfs:
-bash scripts/ppe/collect-ppe-module-info.sh /path/to/extracted-rootfs ./ppe-inventory
-
-# Or pass the directory that directly contains .ko / .ko.xz / .ko.zst files:
-bash scripts/ppe/collect-ppe-module-info.sh /path/to/modules ./ppe-inventory
+python3 -m venv .venv
+. .venv/bin/activate
+pip install ubi_reader
 ```
 
-The scripts are read-only. They produce reports locally; they do not upload firmware dumps, load modules, change router settings, flash firmware, or recover original source code from binaries.
+The scripts are stored as text files, so invoke them with Bash:
+
+```bash
+# 1. Extract a local MTD dump. Keep the dump out of Git.
+bash scripts/ppe/extract-stock-firmware.sh /path/to/mtd19.bin ./rd16-stock
+
+# 2. Inventory PPE/NSS/SSDK/EDMA/ECM/QCA modules and firmware files.
+bash scripts/ppe/collect-ppe-module-info.sh ./rd16-stock/squashfs-root ./ppe-inventory
+
+# 3. Search the kernel/OpenWrt source trees for related code and configuration.
+bash scripts/ppe/scan-ppe-sources.sh /path/to/kernel-qcom-6.18.y ./ppe-kernel-scan.txt
+bash scripts/ppe/scan-ppe-sources.sh /path/to/openwrt-source ./ppe-openwrt-scan.txt
+```
+
+The extractor expects a directly extractable SquashFS image inside the UBI/Binwalk output. If the dump contains UBIFS, vendor-specific compression, or another layout, it will stop with diagnostics; it does not guess offsets or modify the dump. Review `report.txt` and the candidate file types.
+
+The scripts are read-only. They do not upload firmware dumps, load modules, change router settings, flash firmware, or recover original source code from binaries.
 
 ## Required evidence before implementation
 
@@ -51,7 +63,7 @@ CAKE needs to see and schedule the traffic whose latency is being controlled. A 
 ## Current status
 
 - [x] Create an isolated `ppe` branch.
-- [x] Add repeatable module/source inventory scripts.
+- [x] Add local firmware extraction and inventory scripts.
 - [x] Add static shell checks.
 - [ ] Run inventory against the actual RD16 dump and kernel source tree.
 - [ ] Confirm the PPE implementation and its source/license provenance.
