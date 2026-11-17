@@ -202,6 +202,7 @@ static void start_device_probe(void);
 static void history_save(void);
 static int  reapply_game_qos(void);
 static int  recover_wan(void);
+static void speedtest_child_cb(struct uloop_process *p, int ret);
 
 /* ============================================================
  *  Utilities
@@ -1056,9 +1057,9 @@ static void bbuf_add_events(struct blob_buf *b)
         int k = (g_events_idx - g_events_cnt + i + EVENT_RING_SIZE)
                 % EVENT_RING_SIZE;
         void *e = blobmsg_open_table(b, NULL);
-        blobmsg_add_u32 (&b, "ts",     g_events[k].ts);
-        blobmsg_add_u32 (&b, "type",   g_events[k].type);
-        blobmsg_add_string(&b, "detail", g_events[k].detail);
+        blobmsg_add_u32 (b, "ts",     g_events[k].ts);
+        blobmsg_add_u32 (b, "type",   g_events[k].type);
+        blobmsg_add_string(b, "detail", g_events[k].detail);
         blobmsg_close_table(b, e);
     }
     blobmsg_close_array(b, arr);
