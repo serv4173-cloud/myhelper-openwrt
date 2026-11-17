@@ -31,6 +31,7 @@
 #include <getopt.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <netinet/ip_icmp.h>
@@ -184,6 +185,8 @@ static uint32_t    g_speedtest_last_ts      = 0;
 static int         g_speedtest_last_rc      = -1;
 static char        g_speedtest_last_msg[EVENT_DETAIL_LEN] = "";
 static struct uloop_process g_speedtest_proc;
+static int g_qos_reapply_running = 0;
+static struct uloop_process g_qos_reapply_proc;
 
 /* ---------------- uloop / ubus ---------------- */
 static struct uloop_timeout  g_check_timer;
@@ -199,6 +202,7 @@ static void start_device_probe(void);
 static void history_save(void);
 static int  reapply_game_qos(void);
 static int  recover_wan(void);
+static void speedtest_child_cb(struct uloop_process *p, int ret);
 
 /* ============================================================
  *  Utilities
@@ -386,10 +390,31 @@ static void history_save(void)
 
     char *json = blobmsg_format_json(b.head, true);
     if (json) {
-        FILE *f = fopen(HISTORY_FILE, "w");
-        if (f) {
-            if (fputs(json, f) >= 0) fflush(f);
-            fclose(f);
+        char tmp_path[sizeof(HISTORY_FILE) + 16];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", HISTORY_FILE);
+        int fd = mkstemp(tmp_path);
+        if (fd >= 0) {
+            FILE *f = fdopen(fd, "w");
+            if (f) {
+                int ok = (fputs(json, f) >= 0 && fflush(f) == 0 &&
+                          fsync(fileno(f)) == 0);
+                if (fclose(f) != 0) ok = 0;
+                if (ok && rename(tmp_path, HISTORY_FILE) == 0) {
+                    /* Atomic replacement: readers see either old or new JSON. */
+                } else {
+                    unlink(tmp_path);
+                    MY_LOG(LOG_ERR, "history_save: write/rename failed: %s",
+                           strerror(errno));
+                }
+            } else {
+                close(fd);
+                unlink(tmp_path);
+                MY_LOG(LOG_ERR, "history_save: fdopen failed: %s",
+                       strerror(errno));
+            }
+        } else {
+            MY_LOG(LOG_ERR, "history_save: mkstemp failed: %s",
+                   strerror(errno));
         }
         free(json);
     }
@@ -439,6 +464,7 @@ static unsigned short icmp_checksum(const void *buf, int len)
 static int ping_host(const char *host, int timeout_sec, uint32_t *rtt_us_out)
 {
     if (rtt_us_out) *rtt_us_out = 0;
+    if (timeout_sec <= 0) return 0;
 
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -450,34 +476,74 @@ static int ping_host(const char *host, int timeout_sec, uint32_t *rtt_us_out)
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (sock < 0) { freeaddrinfo(res); return 0; }
 
-    struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in target = *(struct sockaddr_in *)res->ai_addr;
+    freeaddrinfo(res);
 
     unsigned char pkt[64] = {0};
     struct icmphdr *icmp = (struct icmphdr *)pkt;
+    const uint16_t ping_id = htons((uint16_t)(getpid() & 0xffff));
+    const uint16_t ping_seq = htons(1);
     icmp->type             = ICMP_ECHO;
     icmp->code             = 0;
-    icmp->un.echo.id       = htons((uint16_t)(getpid() & 0xffff));
-    icmp->un.echo.sequence = htons(1);
+    icmp->un.echo.id       = ping_id;
+    icmp->un.echo.sequence = ping_seq;
     icmp->checksum         = icmp_checksum(pkt, sizeof(pkt));
 
-    struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
-    int ok = 0;
     uint64_t t0 = now_us();
+    uint64_t deadline = t0 + (uint64_t)timeout_sec * 1000000ull;
+    int ok = 0;
+
     if (sendto(sock, pkt, sizeof(pkt), 0,
-               (struct sockaddr *)addr, sizeof(*addr)) > 0) {
-        unsigned char reply[1024];
-        struct sockaddr_in from;
-        socklen_t fromlen = sizeof(from);
-        if (recvfrom(sock, reply, sizeof(reply), 0,
-                     (struct sockaddr *)&from, &fromlen) > 0) {
+               (struct sockaddr *)&target, sizeof(target)) > 0) {
+        for (;;) {
+            uint64_t now = now_us();
+            if (now >= deadline) break;
+
+            uint64_t remaining = deadline - now;
+            struct timeval tv = {
+                .tv_sec = (time_t)(remaining / 1000000ull),
+                .tv_usec = (suseconds_t)(remaining % 1000000ull)
+            };
+            if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+                break;
+
+            unsigned char reply[2048];
+            struct sockaddr_in from;
+            socklen_t fromlen = sizeof(from);
+            ssize_t n = recvfrom(sock, reply, sizeof(reply), 0,
+                                 (struct sockaddr *)&from, &fromlen);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+
+            /* Linux raw ICMP sockets deliver the IPv4 header too. */
+            /* Minimum IPv4 header is 20 bytes; IHL includes options. */
+            if (n < 20) continue;
+            if ((reply[0] >> 4) != 4) continue;
+            size_t ip_hlen = (size_t)(reply[0] & 0x0f) * 4;
+            if (ip_hlen < 20u ||
+                (size_t)n < ip_hlen + sizeof(struct icmphdr))
+                continue;
+            if (from.sin_family != AF_INET ||
+                from.sin_addr.s_addr != target.sin_addr.s_addr)
+                continue;
+
+            const struct icmphdr *resp =
+                (const struct icmphdr *)(reply + ip_hlen);
+            if (resp->type != ICMP_ECHOREPLY || resp->code != 0 ||
+                resp->un.echo.id != ping_id ||
+                resp->un.echo.sequence != ping_seq)
+                continue;
+
             uint64_t t1 = now_us();
-            ok = 1;
             if (rtt_us_out) *rtt_us_out = (uint32_t)(t1 - t0);
+            ok = 1;
+            break;
         }
     }
+
     close(sock);
-    freeaddrinfo(res);
     return ok;
 }
 
@@ -624,10 +690,34 @@ static int recover_wan(void)
 }
 
 /* ============================================================
- *  QoS reapply (synchronous — short)
+ *  QoS reapply (asynchronous — never block uloop)
  * ============================================================ */
+static void qos_reapply_child_cb(struct uloop_process *p, int ret)
+{
+    (void)p;
+    g_qos_reapply_running = 0;
+    refresh_gaming_ip();
+
+    if (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) {
+        event_push(EV_QOS_OK, "apply_qos completed rc=0");
+        MY_LOG(LOG_INFO, "apply_qos completed successfully");
+    } else if (WIFEXITED(ret)) {
+        int rc = WEXITSTATUS(ret);
+        event_push(EV_QOS_FAIL, "apply_qos exited rc=%d", rc);
+        MY_LOG(LOG_WARNING, "apply_qos exited rc=%d", rc);
+    } else {
+        event_push(EV_QOS_FAIL, "apply_qos terminated (status=0x%x)", ret);
+        MY_LOG(LOG_WARNING, "apply_qos terminated (status=0x%x)", ret);
+    }
+}
+
 static int reapply_game_qos(void)
 {
+    if (g_qos_reapply_running) {
+        MY_LOG(LOG_INFO, "QoS reapply already running; skipping duplicate");
+        return -1;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         MY_LOG(LOG_ERR, "reapply_game_qos fork failed: %s", strerror(errno));
@@ -635,38 +725,28 @@ static int reapply_game_qos(void)
         return -1;
     }
     if (pid == 0) {
-        /* ФИКС: закрываем унаследованные сокеты */
         for (int i = 3; i < 1024; i++) close(i);
         freopen("/dev/null", "r", stdin);
         freopen("/dev/null", "w", stdout);
         freopen("/dev/null", "w", stderr);
-        
         execl("/etc/init.d/myhelper-watchdog",
               "myhelper-watchdog", "apply_qos", (char *)NULL);
         _exit(127);
     }
 
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        MY_LOG(LOG_ERR, "waitpid failed: %s", strerror(errno));
-        event_push(EV_QOS_FAIL, "waitpid failed");
+    memset(&g_qos_reapply_proc, 0, sizeof(g_qos_reapply_proc));
+    g_qos_reapply_proc.cb = qos_reapply_child_cb;
+    g_qos_reapply_proc.pid = pid;
+    g_qos_reapply_running = 1;
+    if (uloop_process_add(&g_qos_reapply_proc) != 0) {
+        g_qos_reapply_running = 0;
+        kill(pid, SIGTERM);
+        MY_LOG(LOG_ERR, "failed to register QoS child with uloop");
+        event_push(EV_QOS_FAIL, "uloop_process_add failed");
         return -1;
     }
-    refresh_gaming_ip();
-
-    if (!WIFEXITED(status)) {
-        MY_LOG(LOG_WARNING, "apply_qos terminated abnormally (0x%x)", status);
-        event_push(EV_QOS_FAIL, "apply_qos killed (status=0x%x)", status);
-        return -1;
-    }
-    int rc = WEXITSTATUS(status);
-    if (rc == 0) {
-        event_push(EV_QOS_OK, "apply_qos rc=0");
-    } else {
-        MY_LOG(LOG_WARNING, "apply_qos exited rc=%d", rc);
-        event_push(EV_QOS_FAIL, "apply_qos rc=%d", rc);
-    }
-    return rc;
+    MY_LOG(LOG_INFO, "QoS reapply started asynchronously (pid=%d)", pid);
+    return 0;
 }
 
 /* ============================================================
@@ -713,7 +793,26 @@ static int ubus_speedtest_cb(struct ubus_context *ctx, struct ubus_object *obj,
     memset(&g_speedtest_proc, 0, sizeof(g_speedtest_proc));
     g_speedtest_proc.cb  = speedtest_child_cb;
     g_speedtest_proc.pid = pid;
-    uloop_process_add(&g_speedtest_proc);
+    if (uloop_process_add(&g_speedtest_proc) != 0) {
+        int saved_errno = errno;
+        MY_LOG(LOG_ERR, "speedtest: uloop_process_add failed: %s",
+               strerror(saved_errno));
+        (void)kill(pid, SIGTERM);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        g_speedtest_proc.pid = 0;
+        g_speedtest_running = 0;
+        g_speedtest_last_ts = (uint32_t)time(NULL);
+        g_speedtest_last_rc = -1;
+        snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg),
+                 "process registration failed");
+        event_push(EV_SPEEDTEST_FAIL, "speedtest process registration failed");
+
+        blob_buf_init(&g_bbuf, 0);
+        blobmsg_add_u8(&g_bbuf, "ok", 0);
+        blobmsg_add_string(&g_bbuf, "error", "process registration failed");
+        ubus_send_reply(ctx, req, g_bbuf.head);
+        return 0;
+    }
 
     event_push(EV_SPEEDTEST_START, "speedtest started (pid=%d)", pid);
     MY_LOG(LOG_INFO, "speedtest started (pid=%d)", pid);
@@ -915,6 +1014,25 @@ static void qos_timer_cb(struct uloop_timeout *t)
         MY_LOG(LOG_WARNING, "Post-recovery QoS reapply failed (rc=%d)", rc);
 }
 
+static void speedtest_child_cb(struct uloop_process *p, int ret)
+{
+    (void)p;
+    g_speedtest_running = 0;
+    g_speedtest_last_ts = (uint32_t)time(NULL);
+    g_speedtest_last_rc = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) ? 0 : -1;
+    if (g_speedtest_last_rc == 0)
+        snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg), "completed");
+    else
+        snprintf(g_speedtest_last_msg, sizeof(g_speedtest_last_msg),
+                 "failed (status=0x%x)", ret);
+    event_push(g_speedtest_last_rc == 0 ? EV_SPEEDTEST_OK : EV_SPEEDTEST_FAIL,
+               "speedtest %s (status=0x%x)",
+               g_speedtest_last_rc == 0 ? "completed" : "failed", ret);
+    MY_LOG(g_speedtest_last_rc == 0 ? LOG_INFO : LOG_WARNING,
+           "speedtest %s (status=0x%x)",
+           g_speedtest_last_rc == 0 ? "completed" : "failed", ret);
+}
+
 /* ============================================================
  *  ubus methods
  * ============================================================ */
@@ -939,9 +1057,9 @@ static void bbuf_add_events(struct blob_buf *b)
         int k = (g_events_idx - g_events_cnt + i + EVENT_RING_SIZE)
                 % EVENT_RING_SIZE;
         void *e = blobmsg_open_table(b, NULL);
-        blobmsg_add_u32 (&b, "ts",     g_events[k].ts);
-        blobmsg_add_u32 (&b, "type",   g_events[k].type);
-        blobmsg_add_string(&b, "detail", g_events[k].detail);
+        blobmsg_add_u32 (b, "ts",     g_events[k].ts);
+        blobmsg_add_u32 (b, "type",   g_events[k].type);
+        blobmsg_add_string(b, "detail", g_events[k].detail);
         blobmsg_close_table(b, e);
     }
     blobmsg_close_array(b, arr);
@@ -1019,56 +1137,6 @@ static int ubus_qos_reapply_cb(struct ubus_context *ctx, struct ubus_object *obj
     blob_buf_init(&g_bbuf, 0);
     blobmsg_add_u8 (&g_bbuf, "ok", rc == 0 ? 1 : 0);
     blobmsg_add_u32(&g_bbuf, "rc", (uint32_t)(rc & 0xff));
-    ubus_send_reply(ctx, req, g_bbuf.head);
-    return 0;
-}
-
-static int ubus_speedtest_cb(struct ubus_context *ctx, struct ubus_object *obj,
-                             struct ubus_request_data *req, const char *method,
-                             struct blob_attr *msg)
-{
-    (void)obj; (void)method; (void)msg;
-
-    if (g_speedtest_running) {
-        blob_buf_init(&g_bbuf, 0);
-        blobmsg_add_u8 (&g_bbuf, "ok", 0);
-        blobmsg_add_u8 (&g_bbuf, "busy", 1);
-        blobmsg_add_u32(&g_bbuf, "started_at", g_speedtest_start_ts);
-        ubus_send_reply(ctx, req, g_bbuf.head);
-        return 0;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        blob_buf_init(&g_bbuf, 0);
-        blobmsg_add_u8 (&g_bbuf, "ok", 0);
-        blobmsg_add_string(&g_bbuf, "error", "fork failed");
-        ubus_send_reply(ctx, req, g_bbuf.head);
-        return 0;
-    }
-    if (pid == 0) {
-        freopen("/dev/null", "w", stdout);
-        freopen("/dev/null", "w", stderr);
-        execl("/etc/init.d/myhelper-watchdog",
-              "myhelper-watchdog", "speedtest", (char *)NULL);
-        _exit(127);
-    }
-
-    g_speedtest_running  = 1;
-    g_speedtest_start_ts = (uint32_t)time(NULL);
-
-    memset(&g_speedtest_proc, 0, sizeof(g_speedtest_proc));
-    g_speedtest_proc.cb  = speedtest_child_cb;
-    g_speedtest_proc.pid = pid;
-    uloop_process_add(&g_speedtest_proc);
-
-    event_push(EV_SPEEDTEST_START, "speedtest started (pid=%d)", pid);
-    MY_LOG(LOG_INFO, "speedtest started (pid=%d)", pid);
-
-    blob_buf_init(&g_bbuf, 0);
-    blobmsg_add_u8 (&g_bbuf, "ok", 1);
-    blobmsg_add_u8 (&g_bbuf, "busy", 0);
-    blobmsg_add_u32(&g_bbuf, "started_at", g_speedtest_start_ts);
     ubus_send_reply(ctx, req, g_bbuf.head);
     return 0;
 }

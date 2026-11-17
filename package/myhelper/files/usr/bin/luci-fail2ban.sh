@@ -1,7 +1,18 @@
 #!/bin/sh
-nft add table inet fw4 2>/dev/null
-nft add set inet fw4 luci_bruteforce { type ipv4_addr\; flags dynamic,timeout\; timeout 5m\; } 2>/dev/null
-nft add rule inet fw4 input ip saddr @luci_bruteforce counter drop 2>/dev/null
+# Use the fw4 table managed by firewall4; do not create/delete the table itself.
+# The set and rule are named so startup is safe across procd restarts.
+nft list table inet fw4 >/dev/null 2>&1 || {
+    logger -t luci-fail2ban "firewall4 table inet fw4 is not available"
+    exit 1
+}
+
+if ! nft list set inet fw4 luci_bruteforce >/dev/null 2>&1; then
+    nft add set inet fw4 luci_bruteforce { type ipv4_addr\; flags dynamic,timeout\; timeout 5m\; } || exit 1
+fi
+
+if ! nft -a list chain inet fw4 input 2>/dev/null | grep -q 'ip saddr @luci_bruteforce.*drop'; then
+    nft add rule inet fw4 input ip saddr @luci_bruteforce counter drop || exit 1
+fi
 
 logger -t luci-fail2ban "Started monitoring LuCI failed logins (5 fails / 60s -> block 5m)"
 
@@ -9,9 +20,19 @@ logread -f | while read -r line; do
     case "$line" in
         *"luci: failed login"*)
             IP=$(echo "$line" | sed -n 's/.*from \([0-9a-f:.]*\).*/\1/p')
+            # The nft set is IPv4-only. Validate four decimal octets, 0..255.
+            echo "$IP" | awk -F. '
+                NF != 4 { exit 1 }
+                {
+                    for (i = 1; i <= 4; i++) {
+                        if ($i !~ /^[0-9]+$/ || length($i) > 3 || $i + 0 > 255)
+                            exit 1
+                    }
+                }
+            ' || continue
             if [ -n "$IP" ]; then
                 NOW=$(date +%s)
-                FILE="/tmp/luci_fail_$(echo $IP | tr ':' '_')"
+                FILE="/tmp/luci_fail_$(echo "$IP" | tr '.' '_')"
                 
                 if [ -f "$FILE" ]; then
                     read COUNT OLD_TIME < "$FILE"
@@ -27,8 +48,11 @@ logread -f | while read -r line; do
                 echo "$COUNT $NOW" > "$FILE"
                 
                 if [ "$COUNT" -ge 5 ]; then
-                    nft add element inet fw4 luci_bruteforce { "$IP" timeout 300s } 2>/dev/null
-                    logger -t luci-fail2ban "Blocked $IP for 5m (5 fails in 60s)"
+                    if nft add element inet fw4 luci_bruteforce { "$IP" timeout 300s } 2>/dev/null; then
+                        logger -t luci-fail2ban "Blocked $IP for 5m (5 fails in 60s)"
+                    else
+                        logger -t luci-fail2ban "ERROR: failed to block $IP in nftables"
+                    fi
                     rm -f "$FILE"
                 fi
             fi

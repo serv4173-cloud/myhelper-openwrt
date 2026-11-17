@@ -12,8 +12,7 @@ define Package/myhelper
     SECTION:=utils
     CATEGORY:=Utilities
     TITLE:=Internet watchdog + Game Boost for Xiaomi BE3600
-    DEPENDS:=+ubus +libubus +libubox
-    MAINTAINER:=you@example.com
+    DEPENDS:=+ubus +libubus +libubox +libblobmsg-json +nftables +tc +kmod-nft-core +kmod-sched-core +kmod-sched-cake +kmod-ifb +kmod-tcp-bbr
 endef
 
 define Package/myhelper/description
@@ -23,47 +22,47 @@ define Package/myhelper/description
 endef
 
 define Build/Prepare
-    mkdir -p $(PKG_BUILD_DIR)
-    $(CP) ./src/* $(PKG_BUILD_DIR)/
+	mkdir -p $(PKG_BUILD_DIR)
+	$(CP) ./src/* $(PKG_BUILD_DIR)/
 endef
 
 define Build/Compile
-    $(TARGET_CC) $(TARGET_CFLAGS) -Wall -Wextra -O2 \
+	$(TARGET_CC) $(TARGET_CFLAGS) -Wall -Wextra -O2 \
         -o $(PKG_BUILD_DIR)/myhelper_wd \
-        $(PKG_BUILD_DIR)/watchdog.c \
-        $(TARGET_LDFLAGS) -lubus -lubox -lblobmsg_json
+	$(PKG_BUILD_DIR)/watchdog.c \
+	$(TARGET_LDFLAGS) -lubus -lubox -lblobmsg_json
 endef
 
 define Package/myhelper/install
-    $(INSTALL_DIR) $(1)/usr/bin
-    $(INSTALL_BIN) $(PKG_BUILD_DIR)/myhelper_wd $(1)/usr/bin/myhelper_wd
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/myhelper_wd $(1)/usr/bin/myhelper_wd
 
-    $(INSTALL_DIR) $(1)/etc/init.d
-    $(INSTALL_BIN) ./files/etc/init.d/myhelper-watchdog \
-        $(1)/etc/init.d/myhelper-watchdog
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/etc/init.d/myhelper-watchdog \
+	$(1)/etc/init.d/myhelper-watchdog
 
-    $(INSTALL_DIR) $(1)/etc/config
-    $(INSTALL_CONF) ./files/etc/config/myhelper \
-        $(1)/etc/config/myhelper
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./files/etc/config/myhelper \
+	$(1)/etc/config/myhelper
 
-    $(INSTALL_DIR) $(1)/usr/share/luci/menu.d
-    $(INSTALL_DATA) ./files/usr/share/luci/menu.d/luci-app-myhelper.json \
-        $(1)/usr/share/luci/menu.d/luci-app-myhelper.json
+	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
+	$(INSTALL_DATA) ./files/usr/share/luci/menu.d/luci-app-myhelper.json \
+	$(1)/usr/share/luci/menu.d/luci-app-myhelper.json
 
-    $(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
-    $(INSTALL_DATA) ./files/usr/share/rpcd/acl.d/luci-app-myhelper.json \
-        $(1)/usr/share/rpcd/acl.d/luci-app-myhelper.json
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DATA) ./files/usr/share/rpcd/acl.d/luci-app-myhelper.json \
+	$(1)/usr/share/rpcd/acl.d/luci-app-myhelper.json
 
-    $(INSTALL_DIR) $(1)/www/luci-static/resources/view/myhelper
-    $(INSTALL_DATA) ./files/www/luci-static/resources/view/myhelper/game_boost.js \
-        $(1)/www/luci-static/resources/view/myhelper/game_boost.js
-    $(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/myhelper
+	$(INSTALL_DATA) ./files/www/luci-static/resources/view/myhelper/game_boost.js \
+	$(1)/www/luci-static/resources/view/myhelper/game_boost.js
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/etc/uci-defaults/99-myhelper-boot-success \
 		$(1)/etc/uci-defaults/99-myhelper-boot-success
-    # --- Установка библиотеки Chart.js ---
-    $(INSTALL_DATA) ./files/www/luci-static/resources/view/myhelper/chart.umd.min.js \
-        $(1)/www/luci-static/resources/view/myhelper/chart.umd.min.js
-    # --- Custom Files (sysauth, fail2ban) ---
+	# --- Установка библиотеки Chart.js ---
+	$(INSTALL_DATA) ./files/www/luci-static/resources/view/myhelper/chart.umd.min.js \
+	$(1)/www/luci-static/resources/view/myhelper/chart.umd.min.js
+	# --- Custom Files (sysauth, fail2ban) ---
 
 	# 2. Скрипт fail2ban
 	$(INSTALL_DIR) $(1)/usr/bin

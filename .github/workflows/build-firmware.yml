@@ -2,7 +2,7 @@ name: Build RD16 firmware (prebuild + verify)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, fix/audit-bugfixes-2026-11 ]
   workflow_dispatch:
 
 jobs:
@@ -20,7 +20,14 @@ jobs:
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
             python3 python3-setuptools python3-pip rsync subversion swig time \
             unzip zlib1g-dev file wget bc libelf-dev cpio aria2 squashfs-tools
-          pip install --quiet ubi_reader pyelftools capstone
+          set -e
+          TOOL_VENV="$RUNNER_TEMP/firmware-tools"
+          python3 -m venv "$TOOL_VENV"
+          "$TOOL_VENV/bin/python" -m pip install --upgrade pip
+          "$TOOL_VENV/bin/python" -m pip install ubi_reader pyelftools capstone
+          echo "$TOOL_VENV/bin" >> "$GITHUB_PATH"
+          "$TOOL_VENV/bin/ubireader_extract_images" --help >/dev/null
+          echo "ubi_reader installed: $TOOL_VENV/bin/ubireader_extract_images"
 
       - name: Verify tools
         run: |
@@ -57,21 +64,16 @@ jobs:
           cp -r package/myhelper/* openwrt-src/package/myhelper/
           ls -la openwrt-src/package/myhelper/
 
-      - name: Fix Makefile tabs
-        run: |
-          set -e
-          FILE="openwrt-src/package/myhelper/Makefile"
-          sed -i 's/^    /\t/' "$FILE"
-          grep -nP '^\t' "$FILE" | head -10 | cat -A
-
       - name: Extract vendor feed + kernel from stock firmware
         run: |
           set -e
           cd openwrt-src
           chmod +x vendor_scripts/*.sh
           
-          echo "=== Running prepare_feed.sh rd16 ==="
-          sh vendor_scripts/prepare_feed.sh rd16
+          FW_FILE="miwifi_rd16_firmware_87da2_1.0.31.bin"
+          test -s "$FW_FILE" || { echo "ERROR: missing stock RD16 firmware: $FW_FILE"; exit 1; }
+          echo "=== Running prepare_feed.sh for RD16 ==="
+          sh vendor_scripts/prepare_feed.sh rd16 "$FW_FILE"
 
           echo "=== Checking target/linux/ipq53xx/ structure ==="
           ls -la target/linux/ipq53xx/
@@ -88,68 +90,28 @@ jobs:
           chmod +x vendor_scripts/*.sh vendor_scripts/*.py 2>/dev/null || true
           
           echo "=== Running prepare_config.sh ==="
-          # Пробуем запустить с аргументом rd16, если упадет - пробуем без
-          sh vendor_scripts/prepare_config.sh rd16 || sh vendor_scripts/prepare_config.sh || true
+          # Explicitly select RD16. Never retry without a target, because
+          # the script default may select RD15 and mask the original failure.
+          sh vendor_scripts/prepare_config.sh rd16
+          test -s .config || { echo "ERROR: prepare_config.sh did not create .config"; exit 1; }
 
           # Оставляем ТОЛЬКО prebuild (убираем QSDK, если они есть в конфиге)
-          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk/d' .config 2>/dev/null || true
-          sed -i '/TARGET_DEVICE_ipq53xx_rd16_DEVICE_xiaomi-rd16-qsdk-podkop/d' .config 2>/dev/null || true
+          # The actual symbols include the subtarget component
+          # TARGET_ipq53xx_ipq53xx_32; match only the intended profiles.
+          sed -i '/^CONFIG_TARGET_DEVICE_ipq53xx_ipq53xx_32_DEVICE_xiaomi-rd16-qsdk=y$/d' .config
+          sed -i '/^CONFIG_TARGET_DEVICE_ipq53xx_ipq53xx_32_DEVICE_xiaomi-rd16-qsdk-podkop=y$/d' .config
 
           make defconfig
 
           echo "=== Active RD16 devices ==="
-          grep -E '^CONFIG_TARGET_DEVICE_ipq53xx' .config || echo "!!! NO DEVICES FOUND !!!"
+          if ! grep -E '^CONFIG_TARGET_DEVICE_.*rd16.*=y$' .config; then
+            echo "ERROR: no enabled RD16 device after make defconfig"
+            exit 1
+          fi
 
-      - name: Stub out broken QSDK CLI packages
-        run: |
-          set -e
-          cd openwrt-src
-
-          # These 3 packages use hostapd-2022-09-19.tar.bz2 (404 on all mirrors)
-          # and lack libnl/dbus deps. Replace with empty stubs so dependents build.
-          for pkg in qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor; do
-            PKG_DIR="package/network/utils/$pkg"
-            if [ ! -d "$PKG_DIR" ]; then
-              echo "Not present: $PKG_DIR"
-              continue
-            fi
-            echo "=== Stubbing: $pkg ==="
-            {
-             echo "include \$(TOPDIR)/rules.mk"
-             echo "PKG_NAME:=$pkg"
-             echo "PKG_VERSION:=stub"
-             echo "PKG_RELEASE:=1"
-             echo "include \$(INCLUDE_DIR)/package.mk"
-             echo ""
-             echo "define Package/$pkg"
-             echo "  SECTION:=net"
-             echo "  CATEGORY:=Network"
-             echo "  SUBMENU:=Wireless"
-             echo "  TITLE:=STUB $pkg"
-             echo "  DEPENDS:=@TARGET_ipq53xx"
-             echo "endef"
-             echo ""
-             echo "define Package/$pkg/description"
-             echo "  Stubbed: original source unavailable on OpenWrt mirrors."
-             echo "endef"
-             echo ""
-             echo "define Build/Prepare"
-             echo "endef"
-             echo "define Build/Configure"
-             echo "endef"
-             echo "define Build/Compile"
-             echo "endef"
-             echo ""
-             echo "define Package/$pkg/install"
-             echo "  \$(INSTALL_DIR) \$(1)/usr/sbin"
-             echo "endef"
-             echo ""
-             echo "\$(eval \$(call BuildPackage,$pkg))"
-            } > "$PKG_DIR/Makefile"
-            echo "Stubbed: $PKG_DIR/Makefile"
-            head -5 "$PKG_DIR/Makefile"
-          done
-
+      # Do not replace the vendor supplicant/hostapd with empty packages:
+      # those may be required at runtime for RD16 Wi-Fi. Missing sources should
+      # fail the build rather than silently produce a potentially broken image.
 
       - name: Remove QSDK packages from target.mk
         run: |
@@ -164,11 +126,11 @@ jobs:
           else
             echo "Found target.mk at: $TARGET_MK"
             # Remove ONLY failing packages — KEEP Wi-Fi drivers.
+            # Only remove optional CLI front-ends known to fail in this build.
+            # Preserve vendor Wi-Fi supplicant, hostapd, firmware, CNSS and cfg80211
+            # components until dependency analysis proves a package is unnecessary.
             for pkg in \
-              qca-hostapd-cli qca-wpa-cli qca-wpa-supplicant-vendor \
-              qca-hostap-vendor qca-cfg80211tool-vendor qca-cnss-daemon-vendor \
-              qca-firmware-vendor qca-ssdk-shell kmod-qca-nss-ecm-wifi-plugin \
-              yt-9215s-client ; do
+              qca-hostapd-cli qca-wpa-cli ; do
               sed -i "s|${pkg}||g" "$TARGET_MK"
             done
             echo "=== After removal ==="
@@ -190,24 +152,71 @@ jobs:
           set -e
           cd openwrt-src
           echo "CONFIG_PACKAGE_myhelper=y"             >> .config
-          echo "CONFIG_PACKAGE_nftables=y"            >> .config
-          echo "CONFIG_PACKAGE_tc=y"                  >> .config
+          # Do not force nftables-nojson: the RD16 vendor config may select
+          # nftables-json, and the two variants explicitly conflict. Keep the
+          # target's selected variant; myhelper depends on the virtual nftables package.
+          echo "CONFIG_PACKAGE_tc-tiny=y"             >> .config
           echo "CONFIG_PACKAGE_ethtool=y"             >> .config
           echo "CONFIG_PACKAGE_kmod-sched-cake=y"     >> .config
           echo "CONFIG_PACKAGE_kmod-ifb=y"            >> .config
           echo "CONFIG_PACKAGE_kmod-nft-core=y"       >> .config
           echo "CONFIG_PACKAGE_kmod-tcp-bbr=y"        >> .config
-          echo "CONFIG_PACKAGE_kmod-net-sched=y"      >> .config
-          echo "CONFIG_PACKAGE_kmod-ifb=y"            >> .config
-          echo "CONFIG_PACKAGE_kmod-sched-hfsc=y"     >> .config
-          echo "CONFIG_PACKAGE_kmod-act-mirred=y"     >> .config
-          echo "CONFIG_PACKAGE_kmod-act-gact=y"       >> .config
-          echo "CONFIG_PACKAGE_kmod-sch-ingress=y"    >> .config
-          echo "CONFIG_PACKAGE_zapret=y"               >> .config
-          echo "CONFIG_PACKAGE_luci-app-zapret=y"      >> .config
+          echo "CONFIG_PACKAGE_kmod-sched-core=y"     >> .config
+          # This branch's installed feed provides zapret2/luci-app-zapret2,
+          # not zapret/luci-app-zapret. "feeds list -i" is not supported by
+          # this tree's feeds script; use search to show the actual package names.
+          ./scripts/feeds search zapret2 || true
+          echo "CONFIG_PACKAGE_zapret2=y"               >> .config
+          echo "CONFIG_PACKAGE_luci-app-zapret2=y"      >> .config
           make defconfig
-          echo "=== Verify enabled packages ==="
-          grep -E '^CONFIG_PACKAGE_(myhelper|nftables|tc|kmod-sched-cake|kmod-ifb|kmod-tcp-bbr|kmod-nft-core)=y' .config || true
+          echo "=== Strictly verify required packages after defconfig ==="
+          # Keep whichever mutually-exclusive nftables variant the target selected.
+          # Both nftables-json and nftables-nojson provide the virtual "nftables"
+          # dependency; forcing nojson breaks builds where the vendor config selects json.
+          for pkg in \
+            myhelper tc-tiny ethtool \
+            kmod-sched-core kmod-sched-cake kmod-ifb kmod-nft-core kmod-tcp-bbr; do
+            if ! grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "ERROR: required package is not enabled for firmware: ${pkg}"
+              grep -E "^CONFIG_PACKAGE_${pkg}=" .config || true
+              exit 1
+            fi
+            echo "OK: ${pkg}"
+          done
+          if ! grep -Eq '^CONFIG_PACKAGE_nftables-(json|nojson)=y          # Keep both packages in the firmware image rather than as IPKs only.
+          sed -i \
+            -e 's/^CONFIG_PACKAGE_zapret2=m$/CONFIG_PACKAGE_zapret2=y/' \
+            -e 's/^CONFIG_PACKAGE_luci-app-zapret2=m$/CONFIG_PACKAGE_luci-app-zapret2=y/' .config
+          for pkg in zapret2 luci-app-zapret2; do
+            if ! grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "ERROR: required package ${pkg} is unavailable or not selectable for firmware"
+              echo "=== Feed search ==="
+              ./scripts/feeds search "${pkg}" || true
+              echo "=== Matching package definitions ==="
+              grep -R -l "define Package/${pkg}" package/feeds feeds 2>/dev/null | head -20 || true
+              echo "=== Kconfig result ==="
+              grep -E "^CONFIG_PACKAGE_.*(zapret|nftables).*=" .config || true
+              exit 1
+            fi
+            echo "OK: ${pkg}"
+          done
+
+      - name: Static checks for myhelper package
+        run: |
+          set -eu
+          sh -n openwrt-src/package/myhelper/files/etc/init.d/myhelper-watchdog
+          sh -n openwrt-src/package/myhelper/files/etc/init.d/luci-fail2ban
+          sh -n openwrt-src/package/myhelper/files/usr/bin/luci-fail2ban.sh
+          grep -q "kmod-sched-core" openwrt-src/package/myhelper/Makefile
+          if grep -Eq 'kmod-net-sched|kmod-sched-hfsc|kmod-act-mirred|kmod-act-gact|kmod-sch-ingress' openwrt-src/package/myhelper/Makefile; then
+            echo "ERROR: invalid split scheduler package dependency remains"
+            exit 1
+          fi
+          grep -Fq "grep -oE '[0-9]+([.][0-9]+)?'" openwrt-src/package/myhelper/files/etc/init.d/myhelper-watchdog || {
+            echo "ERROR: speedtest numeric parser does not accept integers and decimals"
+            exit 1
+          }
+          echo "Static shell and package checks passed"
 
       - name: Build kmod toolchain (GCC 7.5.0)
         run: |
@@ -241,7 +250,8 @@ jobs:
               echo "OK: kernel contains NSS references"
             fi
           else
-            echo "WARNING: kernel Image not found in build_dir"
+            echo "ERROR: compiled kernel Image not found in build_dir"
+            exit 1
           fi
 
           echo "=== Locating compiled DTB ==="
@@ -251,7 +261,8 @@ jobs:
             echo "DTB size: $(stat -c%s $DTB) bytes"
             xxd "$DTB" | head -2
           else
-            echo "WARNING: ipq5332-rd16.dtb not found"
+            echo "ERROR: required RD16 DTB ipq5332-rd16.dtb not found"
+            exit 1
           fi
 
       - name: Collect firmware images
@@ -292,22 +303,323 @@ jobs:
           MAGIC=$(xxd -p -l 4 "$UBI_FILE")
           echo "Magic bytes: $MAGIC"
           if [ "$MAGIC" != "55424923" ]; then
-            echo "WARNING: does not start with 'UBI#' magic"
+            echo "ERROR: factory UBI image does not start with UBI# magic"
+            exit 1
           else
             echo "OK: valid UBI# magic"
           fi
 
-          if strings "$UBI_FILE" | grep -q "ipq5332-rd16"; then
-            echo "OK: found ipq5332-rd16 DTB reference"
-          else
-            echo "WARNING: no ipq5332-rd16 DTB reference"
+          # These strings are diagnostic only: DTB/rootfs payloads may be
+          # compressed, so strings(1) cannot reliably prove their presence.
+          strings "$UBI_FILE" | grep -q "ipq5332-rd16" \
+            && echo "INFO: found RD16 DTB text in image" \
+            || echo "INFO: RD16 DTB text not visible in compressed image"
+          strings "$UBI_FILE" | grep -q "myhelper" \
+            && echo "INFO: found myhelper text in image" \
+            || echo "INFO: myhelper text not visible in compressed image"
+
+          if strings "$UBI_FILE" | grep -q "xiaomi"; then
+            echo "OK: found xiaomi references"
           fi
 
-          if strings "$UBI_FILE" | grep -q "myhelper"; then
-            echo "OK: found myhelper"
-          else
-            echo "WARNING: no myhelper in image"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: rd16-firmware-prebuild
+          path: output/*
+          if-no-files-found: error
+          retention-days: 30
+ .config; then
+            echo "ERROR: no nftables userspace variant is enabled after defconfig"
+            grep -E '^CONFIG_PACKAGE_nftables-(json|nojson)=' .config || true
+            exit 1
           fi
+          echo "OK: selected nftables variant:"
+          grep -E '^CONFIG_PACKAGE_nftables-(json|nojson)=y          # Keep both packages in the firmware image rather than as IPKs only.
+          sed -i \
+            -e 's/^CONFIG_PACKAGE_zapret2=m$/CONFIG_PACKAGE_zapret2=y/' \
+            -e 's/^CONFIG_PACKAGE_luci-app-zapret2=m$/CONFIG_PACKAGE_luci-app-zapret2=y/' .config
+          for pkg in zapret2 luci-app-zapret2; do
+            if ! grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "ERROR: required package ${pkg} is unavailable or not selectable for firmware"
+              echo "=== Feed search ==="
+              ./scripts/feeds search "${pkg}" || true
+              echo "=== Matching package definitions ==="
+              grep -R -l "define Package/${pkg}" package/feeds feeds 2>/dev/null | head -20 || true
+              echo "=== Kconfig result ==="
+              grep -E "^CONFIG_PACKAGE_.*(zapret|nftables).*=" .config || true
+              exit 1
+            fi
+            echo "OK: ${pkg}"
+          done
+
+      - name: Static checks for myhelper package
+        run: |
+          set -eu
+          sh -n openwrt-src/package/myhelper/files/etc/init.d/myhelper-watchdog
+          sh -n openwrt-src/package/myhelper/files/etc/init.d/luci-fail2ban
+          sh -n openwrt-src/package/myhelper/files/usr/bin/luci-fail2ban.sh
+          grep -q "kmod-sched-core" openwrt-src/package/myhelper/Makefile
+          if grep -Eq 'kmod-net-sched|kmod-sched-hfsc|kmod-act-mirred|kmod-act-gact|kmod-sch-ingress' openwrt-src/package/myhelper/Makefile; then
+            echo "ERROR: invalid split scheduler package dependency remains"
+            exit 1
+          fi
+          grep -Fq "grep -oE '[0-9]+([.][0-9]+)?'" openwrt-src/package/myhelper/files/etc/init.d/myhelper-watchdog || {
+            echo "ERROR: speedtest numeric parser does not accept integers and decimals"
+            exit 1
+          }
+          echo "Static shell and package checks passed"
+
+      - name: Build kmod toolchain (GCC 7.5.0)
+        run: |
+          set -e
+          cd openwrt-src
+          bash vendor_scripts/build_kmod_toolchain.sh
+
+      - name: Build full firmware
+        run: |
+          set -e
+          cd openwrt-src
+          make -j$(nproc) V=s || make -j1 V=s
+
+      - name: Verify compiled kernel + DTB (Part 3)
+        run: |
+          set -e
+          cd openwrt-src
+
+          echo "=== Locating compiled kernel ==="
+          KERNEL=$(find build_dir -name 'Image' -path '*linux-ipq53xx*rd16*' | head -1)
+          if [ -z "$KERNEL" ]; then
+            KERNEL=$(find build_dir -name 'Image' -path '*linux-ipq53xx*' | head -1)
+          fi
+          echo "Kernel path: $KERNEL"
+          if [ -f "$KERNEL" ]; then
+            echo "Kernel size: $(stat -c%s $KERNEL) bytes"
+            if strings "$KERNEL" | grep -q "ipq53"; then
+              echo "OK: kernel contains ipq53 references"
+            fi
+            if strings "$KERNEL" | grep -q "qca-nss"; then
+              echo "OK: kernel contains NSS references"
+            fi
+          else
+            echo "ERROR: compiled kernel Image not found in build_dir"
+            exit 1
+          fi
+
+          echo "=== Locating compiled DTB ==="
+          DTB=$(find build_dir -name 'ipq5332-rd16.dtb' | head -1)
+          echo "DTB path: $DTB"
+          if [ -f "$DTB" ]; then
+            echo "DTB size: $(stat -c%s $DTB) bytes"
+            xxd "$DTB" | head -2
+          else
+            echo "ERROR: required RD16 DTB ipq5332-rd16.dtb not found"
+            exit 1
+          fi
+
+      - name: Collect firmware images
+        run: |
+          set -e
+          mkdir -p output
+          find openwrt-src/bin/targets -name '*sysupgrade*.bin' -exec cp -v {} output/ \; || true
+          find openwrt-src/bin/targets -name '*factory*.ubi'  -exec cp -v {} output/ \; || true
+          find openwrt-src/bin/targets -name '*factory*.bin'  -exec cp -v {} output/ \; || true
+          find openwrt-src/bin/targets -name '*initramfs*'    -exec cp -v {} output/ \; || true
+          find openwrt-src/bin -name 'myhelper*.ipk' -exec cp -v {} output/ \; || true
+          echo "=== output ==="
+          ls -la output/
+
+      - name: Verify UBI image (Part 1)
+        run: |
+          set -e
+          cd output
+
+          UBI_FILE=$(find . -name '*prebuild*factory.ubi' | head -1)
+          if [ -z "$UBI_FILE" ]; then
+            UBI_FILE=$(find . -name '*factory.ubi' | head -1)
+          fi
+          if [ -z "$UBI_FILE" ]; then
+            echo "ERROR: no factory.ubi found in output"
+            ls -la
+            exit 1
+          fi
+
+          echo "Checking: $UBI_FILE"
+          SIZE=$(stat -c%s "$UBI_FILE")
+          echo "Size: $SIZE bytes"
+
+          if [ "$SIZE" -lt 4000000 ] || [ "$SIZE" -gt 20000000 ]; then
+            echo "WARNING: size outside expected 4-20 MB range"
+          fi
+
+          MAGIC=$(xxd -p -l 4 "$UBI_FILE")
+          echo "Magic bytes: $MAGIC"
+          if [ "$MAGIC" != "55424923" ]; then
+            echo "ERROR: factory UBI image does not start with UBI# magic"
+            exit 1
+          else
+            echo "OK: valid UBI# magic"
+          fi
+
+          # These strings are diagnostic only: DTB/rootfs payloads may be
+          # compressed, so strings(1) cannot reliably prove their presence.
+          strings "$UBI_FILE" | grep -q "ipq5332-rd16" \
+            && echo "INFO: found RD16 DTB text in image" \
+            || echo "INFO: RD16 DTB text not visible in compressed image"
+          strings "$UBI_FILE" | grep -q "myhelper" \
+            && echo "INFO: found myhelper text in image" \
+            || echo "INFO: myhelper text not visible in compressed image"
+
+          if strings "$UBI_FILE" | grep -q "xiaomi"; then
+            echo "OK: found xiaomi references"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: rd16-firmware-prebuild
+          path: output/*
+          if-no-files-found: error
+          retention-days: 30
+ .config
+
+          # Include the actual package names exposed by the zapret2 feed.
+          # Keep both packages in the firmware image rather than as IPKs only.
+          sed -i \
+            -e 's/^CONFIG_PACKAGE_zapret2=m$/CONFIG_PACKAGE_zapret2=y/' \
+            -e 's/^CONFIG_PACKAGE_luci-app-zapret2=m$/CONFIG_PACKAGE_luci-app-zapret2=y/' .config
+          for pkg in zapret2 luci-app-zapret2; do
+            if ! grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "ERROR: required package ${pkg} is unavailable or not selectable for firmware"
+              echo "=== Feed search ==="
+              ./scripts/feeds search "${pkg}" || true
+              echo "=== Matching package definitions ==="
+              grep -R -l "define Package/${pkg}" package/feeds feeds 2>/dev/null | head -20 || true
+              echo "=== Kconfig result ==="
+              grep -E "^CONFIG_PACKAGE_.*(zapret|nftables).*=" .config || true
+              exit 1
+            fi
+            echo "OK: ${pkg}"
+          done
+
+      - name: Static checks for myhelper package
+        run: |
+          set -eu
+          sh -n openwrt-src/package/myhelper/files/etc/init.d/myhelper-watchdog
+          sh -n openwrt-src/package/myhelper/files/etc/init.d/luci-fail2ban
+          sh -n openwrt-src/package/myhelper/files/usr/bin/luci-fail2ban.sh
+          grep -q "kmod-sched-core" openwrt-src/package/myhelper/Makefile
+          if grep -Eq 'kmod-net-sched|kmod-sched-hfsc|kmod-act-mirred|kmod-act-gact|kmod-sch-ingress' openwrt-src/package/myhelper/Makefile; then
+            echo "ERROR: invalid split scheduler package dependency remains"
+            exit 1
+          fi
+          grep -Fq "grep -oE '[0-9]+([.][0-9]+)?'" openwrt-src/package/myhelper/files/etc/init.d/myhelper-watchdog || {
+            echo "ERROR: speedtest numeric parser does not accept integers and decimals"
+            exit 1
+          }
+          echo "Static shell and package checks passed"
+
+      - name: Build kmod toolchain (GCC 7.5.0)
+        run: |
+          set -e
+          cd openwrt-src
+          bash vendor_scripts/build_kmod_toolchain.sh
+
+      - name: Build full firmware
+        run: |
+          set -e
+          cd openwrt-src
+          make -j$(nproc) V=s || make -j1 V=s
+
+      - name: Verify compiled kernel + DTB (Part 3)
+        run: |
+          set -e
+          cd openwrt-src
+
+          echo "=== Locating compiled kernel ==="
+          KERNEL=$(find build_dir -name 'Image' -path '*linux-ipq53xx*rd16*' | head -1)
+          if [ -z "$KERNEL" ]; then
+            KERNEL=$(find build_dir -name 'Image' -path '*linux-ipq53xx*' | head -1)
+          fi
+          echo "Kernel path: $KERNEL"
+          if [ -f "$KERNEL" ]; then
+            echo "Kernel size: $(stat -c%s $KERNEL) bytes"
+            if strings "$KERNEL" | grep -q "ipq53"; then
+              echo "OK: kernel contains ipq53 references"
+            fi
+            if strings "$KERNEL" | grep -q "qca-nss"; then
+              echo "OK: kernel contains NSS references"
+            fi
+          else
+            echo "ERROR: compiled kernel Image not found in build_dir"
+            exit 1
+          fi
+
+          echo "=== Locating compiled DTB ==="
+          DTB=$(find build_dir -name 'ipq5332-rd16.dtb' | head -1)
+          echo "DTB path: $DTB"
+          if [ -f "$DTB" ]; then
+            echo "DTB size: $(stat -c%s $DTB) bytes"
+            xxd "$DTB" | head -2
+          else
+            echo "ERROR: required RD16 DTB ipq5332-rd16.dtb not found"
+            exit 1
+          fi
+
+      - name: Collect firmware images
+        run: |
+          set -e
+          mkdir -p output
+          find openwrt-src/bin/targets -name '*sysupgrade*.bin' -exec cp -v {} output/ \; || true
+          find openwrt-src/bin/targets -name '*factory*.ubi'  -exec cp -v {} output/ \; || true
+          find openwrt-src/bin/targets -name '*factory*.bin'  -exec cp -v {} output/ \; || true
+          find openwrt-src/bin/targets -name '*initramfs*'    -exec cp -v {} output/ \; || true
+          find openwrt-src/bin -name 'myhelper*.ipk' -exec cp -v {} output/ \; || true
+          echo "=== output ==="
+          ls -la output/
+
+      - name: Verify UBI image (Part 1)
+        run: |
+          set -e
+          cd output
+
+          UBI_FILE=$(find . -name '*prebuild*factory.ubi' | head -1)
+          if [ -z "$UBI_FILE" ]; then
+            UBI_FILE=$(find . -name '*factory.ubi' | head -1)
+          fi
+          if [ -z "$UBI_FILE" ]; then
+            echo "ERROR: no factory.ubi found in output"
+            ls -la
+            exit 1
+          fi
+
+          echo "Checking: $UBI_FILE"
+          SIZE=$(stat -c%s "$UBI_FILE")
+          echo "Size: $SIZE bytes"
+
+          if [ "$SIZE" -lt 4000000 ] || [ "$SIZE" -gt 20000000 ]; then
+            echo "WARNING: size outside expected 4-20 MB range"
+          fi
+
+          MAGIC=$(xxd -p -l 4 "$UBI_FILE")
+          echo "Magic bytes: $MAGIC"
+          if [ "$MAGIC" != "55424923" ]; then
+            echo "ERROR: factory UBI image does not start with UBI# magic"
+            exit 1
+          else
+            echo "OK: valid UBI# magic"
+          fi
+
+          # These strings are diagnostic only: DTB/rootfs payloads may be
+          # compressed, so strings(1) cannot reliably prove their presence.
+          strings "$UBI_FILE" | grep -q "ipq5332-rd16" \
+            && echo "INFO: found RD16 DTB text in image" \
+            || echo "INFO: RD16 DTB text not visible in compressed image"
+          strings "$UBI_FILE" | grep -q "myhelper" \
+            && echo "INFO: found myhelper text in image" \
+            || echo "INFO: myhelper text not visible in compressed image"
 
           if strings "$UBI_FILE" | grep -q "xiaomi"; then
             echo "OK: found xiaomi references"
